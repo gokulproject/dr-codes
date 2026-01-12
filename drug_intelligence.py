@@ -374,4 +374,71 @@ def move_to_bot_out():
             send_email(Config.SUCCESS_TO_ADDRESS, Config.SUCCESS_MAIL_SUBJECT, success_mail_body, attachments=attachments_str, cc_address=Config.SUCCESS_CC_ADDRESS)
             LOGGER.info("Success email sent.")
 
-            for root, dirs, file
+            for root, dirs, files in os.walk(Config.BOT_INPROGRESSPATH):
+                for file in files:
+                    os.remove(os.path.join(root, file))
+                for dir in dirs:
+                    shutil.rmtree(os.path.join(root, dir))
+            LOGGER.info("Inprogress directory cleared.")
+
+        LOGGER.info("Move to BOT-OUT completed successfully.")
+    except Exception as e:
+        LOGGER.error(f"Move to BOT-OUT failed: {e}")
+    finally:
+        disconnect_from_db(conn)
+
+def move_to_processed(customer_name, client_filepath):
+    """MOVE_TO_PROCESSED logic."""
+    LOGGER.info(f"Starting move to processed for {customer_name}: {client_filepath}")
+    try:
+        client_processed_dir = os.path.join(Config.BOT_PROCESSEDPATH, customer_name)
+        os.makedirs(client_processed_dir, exist_ok=True)
+        LOGGER.info(f"Processed dir checked/created: {client_processed_dir}")
+        shutil.move(client_filepath, client_processed_dir)
+        LOGGER.info(f"Moved to processed successfully: {client_filepath}")
+    except Exception as e:
+        LOGGER.error(f"Move to processed failed: {e}")
+
+def move_failed_clientfile(customer_name, client_filepath, log_id):
+    """MOVE_FAILED_CLIENTFILE logic."""
+    LOGGER.info(f"Starting move failed client file for {customer_name}: {client_filepath}")
+    try:
+        client_failed_dir = os.path.join(Config.BOT_FAILEDPATH, customer_name)
+        os.makedirs(client_failed_dir, exist_ok=True)
+        LOGGER.info(f"Failed dir checked/created: {client_failed_dir}")
+        shutil.move(client_filepath, client_failed_dir)
+        filename = os.path.basename(client_filepath)
+        conn = connect_to_db()
+        execute_query(conn, f"UPDATE {Config.LOG_REPORT} SET failed_sts='1', failure_message='Failed while processing {customer_name} customer - {filename}', end_datetime=NOW() WHERE log_id=%s", params=(log_id,))
+        LOGGER.info(f"Moved failed client file successfully: {client_filepath}")
+    except Exception as e:
+        LOGGER.error(f"Move failed client file failed: {e}")
+    finally:
+        disconnect_from_db(conn)
+
+def move_to_failed(error_message):
+    """MOVE_TO_FAILED logic."""
+    LOGGER.info(f"Starting move to failed with message: {error_message}")
+    try:
+        os.makedirs(Config.BOT_FAILEDPATH, exist_ok=True)
+        LOGGER.info(f"Failed path checked/created: {Config.BOT_FAILEDPATH}")
+        shutil.move(master_tracker_path, Config.BOT_FAILEDPATH)
+        shutil.move(di_output_dir, Config.BOT_FAILEDPATH)
+        LOGGER.info("Files moved to failed.")
+
+        conn = connect_to_db()
+        execute_query(conn, f"UPDATE {Config.PROCESS_STATUS} SET process_status='Failed', error_message=%s, end_datetime=NOW() WHERE process_id=%s", params=(error_message, process_id))
+        LOGGER.info("Process status updated to Failed.")
+
+        filename = os.path.basename(master_tracker_path)
+        attachment = os.path.join(Config.BOT_FAILEDPATH, filename)
+
+        failure_mail_body = Config.FAILURE_MAIL_BODY.replace("<process_id>", f" {process_id} - {filename} - {error_message}").replace("<>", "\n")
+
+        send_email(Config.FAILURE_TO_ADDRESS, Config.FAILURE_MAIL_SUBJECT, failure_mail_body, attachments=attachment, cc_address=Config.FAILURE_CC_ADDRESS)
+        LOGGER.info("Failure email sent.")
+        LOGGER.info(error_message)
+    except Exception as e:
+        LOGGER.error(f"Move to failed failed: {e}")
+    finally:
+        disconnect_from_db(conn)
