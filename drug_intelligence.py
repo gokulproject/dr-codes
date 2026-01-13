@@ -503,4 +503,75 @@ def MOVE_TO_BOT_OUT(config, db):
         return
     
     # Move master tracker to output
-    di_ou
+    
+
+di_output_dir = os.path.join(config.process_variables['bot_outpath'], str(process_id))
+    master_tracker_path = config.process_variables['master_tracker_path']
+    
+    if os.path.exists(master_tracker_path):
+        dest_path = os.path.join(di_output_dir, os.path.basename(master_tracker_path))
+        shutil.move(master_tracker_path, dest_path)
+    
+    # Collect attachments
+    attachments = []
+    for filename in os.listdir(di_output_dir):
+        if filename.endswith('.xlsx') and 'Conflict' not in filename:
+            attachments.append(os.path.join(di_output_dir, filename))
+    
+    # Send success email
+    attachments_str = ';'.join(attachments)
+    send_success_email(config, completedQuery, failedQuery, attachments_str)
+    
+    # Clean inprogress
+    bot_inprogresspath = config.process_variables['bot_inprogresspath']
+    for item in os.listdir(bot_inprogresspath):
+        item_path = os.path.join(bot_inprogresspath, item)
+        if os.path.isfile(item_path):
+            os.remove(item_path)
+        elif os.path.isdir(item_path):
+            shutil.rmtree(item_path)
+    
+    logger.info("✅ MOVE_TO_BOT_OUT completed")
+
+
+def MASTER_TRACKER_UPDATE(config, db):
+    """MASTER_TRACKER_UPDATE - Exact Robot Framework logic"""
+    logger.info("\n" + "="*60)
+    logger.info("MASTER_TRACKER_UPDATE")
+    logger.info("="*60)
+    
+    # Get customer list
+    customer_table = config.process_variables['customer_table']
+    customer_list = db.query(f"SELECT customer_id, customer_name FROM {customer_table} WHERE status = 1")
+    
+    logger.info(f"Found {len(customer_list)} active customers")
+    
+    # Process each customer
+    for customer_info in customer_list:
+        try:
+            EXECUTE_EACH_CUSTOMER(customer_info, config, db)
+        except Exception as e:
+            logger.error(f"❌ Error processing {customer_info['customer_name']}: {e}")
+    
+    # Generate reports
+    try:
+        GENERATE_REPORT(config, db)
+    except Exception as e:
+        logger.error(f"⚠️  Report generation failed: {e}")
+    
+    # Move to BOT-OUT
+    try:
+        MOVE_TO_BOT_OUT(config, db)
+    except Exception as e:
+        logger.error(f"⚠️  Move to BOT-OUT failed: {e}")
+    
+    # Update final status
+    process_status = config.table_names['process_status']
+    process_id = config.process_variables['process_id']
+    db.execute_sql_string(f"""
+        UPDATE {process_status}
+        SET process_status='Completed', end_datetime=NOW()
+        WHERE process_id='{process_id}'
+    """)
+    
+    logger.info("\n✅ MASTER_TRACKER_UPDATE
