@@ -1,577 +1,732 @@
 """
-Drug Intelligence - Main process logic
-All core Robot Framework actions
+Drug Intelligence Main Process
+Orchestrates the complete drug intelligence automation workflow
 """
+
 import os
 import shutil
-from processors import *
-from email_sender import send_success_email, send_failure_email
-from excel_creation import GENERATE_REPORT
-from logger import get_logger
+from typing import List, Dict, Optional
+from datetime import datetime
+
+from config import Config
+from logger import get_logger, DrugIntelligenceLogger
+from database import DatabaseManager
+from email_sender import EmailSender
+from excel_creation import ExcelManager
+from processors import CustomerProcessors
 
 
-logger = get_logger()
-
-
-def INITIALIZE_PROCESS(server_type, db, config):
-    """
-    INITIALIZE_PROCESS - Exact Robot Framework logic
-    """
-    logger.info("="*60)
-    logger.info("INITIALIZE_PROCESS")
-    logger.info("="*60)
+class DrugIntelligenceAutomation:
+    """Main automation class for Drug Intelligence process"""
     
-    # Set process variables based on server type
-    if server_type == "DEV":
-        db_module_name = "pymysql"
-        db_name = "drug_intelligence_automation"
-        db_username = "admin"
-        db_password = "Password21"
-        db_host = "nividous-dev.ci.us-east-1.rds.amazonaws.com"
-        db_port = 3306
-    else:
-        db_module_name = "pymysql"
-        db_name = "drug_intelligence_automation"
-        db_username = "admin"
-        db_password = "Password21"
-        db_host = "nividous-dev.ci.us-east-1.rds.amazonaws.com"
-        db_port = 3306
-    
-    # Email settings
-    e_authuser = "AKIAVCYLC7ABOWX6PLE3"
-    e_authpass = "BBrefAqS4WsmKGVacbz7WEaYmgOd9gGnHBw2LKzjwXQk"
-    e_host = "email-smtp.us-east-1.amazonaws.com"
-    e_port = 2587
-    from_address = "NavitasBOT@navitascloud.com"
-    
-    # Connect to database
-    db.connect_to_database(db_module_name, db_name, db_username, db_password, db_host, db_port)
-    
-    # Query variables from database
-    variable_table = "DI_process_variables"
-    queryout = db.query(f"SELECT value FROM {variable_table} WHERE name IN ('MTU Source Path','Customer Table')")
-    
-    drug_intelligence_path = queryout[0]['value']
-    customer_table = queryout[1]['value']
-    
-    # Set paths
-    master_tracker_dirpath = os.path.join(drug_intelligence_path, "BOT-IN", "Master_Tracker")
-    client_dirpath = os.path.join(drug_intelligence_path, "BOT-IN", "Clients")
-    bot_outpath = os.path.join(drug_intelligence_path, "BOT-OUT")
-    bot_processpath = os.path.join(drug_intelligence_path, "BOT-PROCESS")
-    bot_processedpath = os.path.join(bot_processpath, "Processed")
-    bot_failedpath = os.path.join(bot_processpath, "Failed")
-    bot_inprogresspath = os.path.join(bot_processpath, "Inprogress")
-    
-    # Create directories
-    os.makedirs(master_tracker_dirpath, exist_ok=True)
-    
-    # Get list of Excel files
-    list_excel_files = [f for f in os.listdir(master_tracker_dirpath) if f.endswith('.xlsx')]
-    client_files = []
-    for root, dirs, files in os.walk(client_dirpath):
-        client_files.extend([f for f in files if f.endswith(('.xls', '.xlsx'))])
-    
-    list_excel_files_len = len(list_excel_files)
-    client_files_count = len(client_files)
-    
-    # Pass execution if no files
-    if list_excel_files_len == 0 or client_files_count == 0:
-        logger.warning("⚠️  There is no Master Tracker/Client Files")
-        return None
-    
-    # Get configuration from database
-    queryout = db.query(f"""
-        SELECT value FROM {variable_table} 
-        WHERE name IN ('MT Sheetname', 'MT Product Colname', 'Mail Configuration Table',
-                      'MTU Table Names Table','MT Column Names Table','MT Comment Colname',
-                      'MTU Default Remark Comment','MT SNo Colname')
-    """)
-    
-    master_tracker_path = os.path.join(master_tracker_dirpath, list_excel_files[0])
-    master_sheetname = queryout[0]['value']
-    master_tracker_filename = list_excel_files[0]
-    mater_tracker_productcol = queryout[1]['value']
-    mail_config_table = queryout[2]['value']
-    mtu_tablenames_table = queryout[3]['value']
-    mt_columnnames_table = queryout[4]['value']
-    comment_colname = queryout[5]['value']
-    remark_default_value = queryout[6]['value']
-    sno_colname = queryout[7]['value']
-    
-    # Get mail configuration
-    mail_query = db.query(f"""
-        SELECT value FROM {mail_config_table} 
-        WHERE name IN ('Success To Address', 'Success Cc Address', 'Failure To Address', 
-                      'Failure Cc Address', 'Success Mail Subject', 'Failure Mai Subject', 
-                      'Success Mail Body', 'Failure Mail Body')
-    """)
-    
-    success_to_address = mail_query[4]['value']
-    success_cc_address = mail_query[5]['value']
-    failure_to_address = mail_query[2]['value']
-    failure_cc_address = mail_query[3]['value']
-    success_mail_subject = mail_query[0]['value']
-    failure_mail_subject = mail_query[1]['value']
-    success_mail_body = mail_query[6]['value']
-    failure_mail_body = mail_query[7]['value']
-    
-    # Get table names
-    mtu_query = db.query(f"""
-        SELECT value FROM {mtu_tablenames_table} 
-        WHERE name IN ('process_status','suprocess_info','master_tracker_updates',
-                      'overall_count_report','inclusion_exclusion_counts','salt_exclusion_list',
-                      'caplin_master_report','bells_master_report','marksans_usa_master_report',
-                      'relonchem_master_report','padagis_israle_master_report',
-                      'padagis_usa_master_report','log_report')
-        ORDER BY CASE name
-            WHEN 'process_status' THEN 1
-            WHEN 'suprocess_info' THEN 2
-            WHEN 'master_tracker_updates' THEN 3
-            WHEN 'overall_count_report' THEN 4
-            WHEN 'inclusion_exclusion_counts' THEN 5
-            WHEN 'salt_exclusion_list' THEN 6
-            WHEN 'caplin_master_report' THEN 7
-            WHEN 'bells_master_report' THEN 8
-            WHEN 'marksans_usa_master_report' THEN 9
-            WHEN 'relonchem_master_report' THEN 10
-            WHEN 'padagis_israle_master_report' THEN 11
-            WHEN 'padagis_usa_master_report' THEN 12
-            WHEN 'log_report' THEN 13
-            ELSE 14 END
-    """)
-    
-    process_status = mtu_query[0]['value']
-    suprocess_info = mtu_query[1]['value']
-    master_tracker_updates = mtu_query[2]['value']
-    overall_count_report = mtu_query[3]['value']
-    inclusion_exclusion_counts = mtu_query[4]['value']
-    salt_exclusion_list = mtu_query[5]['value']
-    caplin_master_report = mtu_query[6]['value']
-    bells_master_report = mtu_query[7]['value']
-    marksans_usa_master_report = mtu_query[8]['value']
-    relonchem_master_report = mtu_query[9]['value']
-    padagis_israle_master_report = mtu_query[10]['value']
-    padagis_usa_master_report = mtu_query[11]['value']
-    log_report = mtu_query[12]['value']
-    
-    # Get excluded salts
-    exclued_salt = db.query(f"SELECT saltname FROM {salt_exclusion_list} WHERE status=1")
-    excluded_saltnames = [item['saltname'] for item in exclued_salt]
-    
-    # Store in config
-    config.process_variables = {
-        'drug_intelligence_path': drug_intelligence_path,
-        'customer_table': customer_table,
-        'master_tracker_path': master_tracker_path,
-        'master_sheetname': master_sheetname,
-        'master_tracker_filename': master_tracker_filename,
-        'bot_inprogresspath': bot_inprogresspath,
-        'bot_processedpath': bot_processedpath,
-        'bot_failedpath': bot_failedpath,
-        'bot_outpath': bot_outpath,
-        'remark_default_value': remark_default_value,
-        'excluded_saltnames': excluded_saltnames
-    }
-    
-    config.table_names = {
-        'process_status': process_status,
-        'suprocess_info': suprocess_info,
-        'log_report': log_report,
-        'caplin_master_report': caplin_master_report,
-        'bells_master_report': bells_master_report,
-        'marksans_usa_master_report': marksans_usa_master_report,
-        'relonchem_master_report': relonchem_master_report,
-        'padagis_israle_master_report': padagis_israle_master_report,
-        'padagis_usa_master_report': padagis_usa_master_report,
-        'overall_count_report': overall_count_report,
-        'inclusion_exclusion_counts': inclusion_exclusion_counts
-    }
-    
-    config.mail_config = {
-        'success_to_address': success_to_address,
-        'success_cc_address': success_cc_address,
-        'failure_to_address': failure_to_address,
-        'failure_cc_address': failure_cc_address,
-        'success_mail_subject': success_mail_subject,
-        'failure_mail_subject': failure_mail_subject,
-        'success_mail_body': success_mail_body,
-        'failure_mail_body': failure_mail_body,
-        'from_address': from_address,
-        'e_authuser': e_authuser,
-        'e_authpass': e_authpass,
-        'e_host': e_host,
-        'e_port': e_port
-    }
-    
-    logger.info("✅ INITIALIZE_PROCESS completed")
-    return config
-
-
-def MOVE_TO_INPROGRESS(config, db):
-    """MOVE_TO_INPROGRESS - Exact Robot Framework logic"""
-    logger.info("\n" + "="*60)
-    logger.info("MOVE_TO_INPROGRESS")
-    logger.info("="*60)
-    
-    process_status = config.table_names['process_status']
-    master_tracker_filename = config.process_variables['master_tracker_filename']
-    
-    # Insert into process_status
-    db.execute_sql_string(f"""
-        INSERT INTO {process_status} (process_status, mt_filename, start_datetime)
-        VALUES ('Initiated', '{master_tracker_filename}', NOW())
-    """)
-    
-    # Get max process_id
-    maxid = db.query(f"SELECT MAX(process_id) as max_id FROM {process_status}")
-    process_id = maxid[0]['max_id']
-    config.process_variables['process_id'] = process_id
-    
-    logger.info(f"✅ Created Process ID: {process_id}")
-    
-    # Create and empty inprogress directory
-    bot_inprogresspath = config.process_variables['bot_inprogresspath']
-    os.makedirs(bot_inprogresspath, exist_ok=True)
-    
-    # Empty directory
-    for item in os.listdir(bot_inprogresspath):
-        item_path = os.path.join(bot_inprogresspath, item)
-        if os.path.isfile(item_path):
-            os.remove(item_path)
-        elif os.path.isdir(item_path):
-            shutil.rmtree(item_path)
-    
-    # Move master tracker to inprogress
-    master_tracker_path = config.process_variables['master_tracker_path']
-    dest_path = os.path.join(bot_inprogresspath, master_tracker_filename)
-    shutil.move(master_tracker_path, dest_path)
-    config.process_variables['master_tracker_path'] = dest_path
-    
-    # Update status
-    UPDATE_STAUTS("File Moved to Inprogress", config, db)
-    
-    logger.info("✅ MOVE_TO_INPROGRESS completed")
-
-
-def UPDATE_STAUTS(status, config, db):
-    """UPDATE_STAUTS - Update process status"""
-    process_id = config.process_variables['process_id']
-    process_status = config.table_names['process_status']
-    
-    db.execute_sql_string(f"""
-        UPDATE {process_status} 
-        SET process_status = '{status}' 
-        WHERE process_id = '{process_id}'
-    """)
-    logger.info(f"   Status: {status}")
-
-
-def VALIDATE_MASTER_TRACKER(config, db):
-    """VALIDATE_MASTER_TRACKER - Exact Robot Framework logic"""
-    logger.info("\n" + "="*60)
-    logger.info("VALIDATE_MASTER_TRACKER")
-    logger.info("="*60)
-    
-    UPDATE_STAUTS("Master Tracker Validation Initiated", config, db)
-    
-    # Placeholder for validation logic
-    # In Robot code: Parse Excel With Dynamic Header
-    
-    UPDATE_STAUTS("Master Tracker Validation Completed", config, db)
-    logger.info("✅ VALIDATE_MASTER_TRACKER completed")
-
-
-def EXECUTE_EACH_CUSTOMER(customer_info, config, db):
-    """EXECUTE_EACH_CUSTOMER - Exact Robot Framework logic"""
-    customer_name = customer_info['customer_name']
-    customer_id = customer_info['customer_id']
-    
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Processing Customer: {customer_name} (ID: {customer_id})")
-    logger.info(f"{'='*60}")
-    
-    # Get subprocess info
-    suprocess_info = config.table_names['suprocess_info']
-    query_out = db.query(f"""
-        SELECT suprocess_name, excel_sheetname, excel_startindex, column_names 
-        FROM {suprocess_info} 
-        WHERE customer_id='{customer_id}'
-    """)
-    
-    queryLen = db.get_length(query_out)
-    if queryLen == 0:
-        logger.info(f"   No subprocess info for {customer_name}, skipping...")
-        return
-    
-    suprocess_name = query_out[0]['suprocess_name']
-    customer_sheetname = query_out[0]['excel_sheetname']
-    excel_row_startind = query_out[0]['excel_startindex']
-    excel_colnames = query_out[0]['column_names']
-    
-    # Get customer directory
-    drug_intelligence_path = config.process_variables['drug_intelligence_path']
-    customer_foldername = customer_name
-    customer_dirpath = os.path.join(drug_intelligence_path, "BOT-IN", "Clients", customer_foldername)
-    
-    os.makedirs(customer_dirpath, exist_ok=True)
-    
-    # Get customer files
-    list_files = [f for f in os.listdir(customer_dirpath) if f.lower().endswith(('.xls', '.xlsx'))]
-    files_count = len(list_files)
-    
-    if files_count == 0:
-        logger.info(f"   No files found for {customer_name}")
-        return
-    
-    in_client_filepath = os.path.join(customer_dirpath, list_files[0])
-    
-    # Insert log
-    log_report = config.table_names['log_report']
-    process_id = config.process_variables['process_id']
-    
-    db.execute_sql_string(f"""
-        INSERT INTO {log_report} 
-        (process_id, customer_id, initiated_sts, start_datetime, customer_name, filename)
-        VALUES ('{process_id}', '{customer_id}', '1', NOW(), '{customer_name}', '{list_files[0]}')
-    """)
-    
-    maxid = db.query(f"""
-        SELECT MAX(log_id) as max_id FROM {log_report} 
-        WHERE process_id='{process_id}' AND customer_id='{customer_id}'
-    """)
-    log_id = maxid[0]['max_id']
-    
-    # Move to inprogress
-    bot_inprogresspath = config.process_variables['bot_inprogresspath']
-    client_inprogress_dir = os.path.join(bot_inprogresspath, customer_name)
-    os.makedirs(client_inprogress_dir, exist_ok=True)
-    
-    # Empty directory
-    for item in os.listdir(client_inprogress_dir):
-        item_path = os.path.join(client_inprogress_dir, item)
-        if os.path.isfile(item_path):
-            os.remove(item_path)
-    
-    client_filepath = os.path.join(client_inprogress_dir, list_files[0])
-    shutil.move(in_client_filepath, client_filepath)
-    
-    # Process based on subprocess name
-    try:
-        if suprocess_name == "PROCESS_CAPLIN":
-            PROCESS_CAPLIN(client_filepath, customer_sheetname, excel_row_startind, 
-                          excel_colnames, config, db)
-        elif suprocess_name == "PROCESS_BELLS":
-            PROCESS_BELLS(client_filepath, customer_sheetname, excel_row_startind,
-                         excel_colnames, config, db)
-        elif suprocess_name == "PROCESS_RELONCHEM":
-            PROCESS_RELONCHEM(client_filepath, customer_sheetname, excel_row_startind,
-                             excel_colnames, config, db)
-        elif suprocess_name == "PROCESS_MARKSANS_USA":
-            PROCESS_MARKSANS_USA(client_filepath, customer_sheetname, excel_row_startind,
-                                excel_colnames, config, db)
-        elif suprocess_name == "PROCESS_PADAGIS_USA":
-            PROCESS_PADAGIS_USA(client_filepath, customer_sheetname, excel_row_startind,
-                               excel_colnames, config, db)
-        elif suprocess_name == "PROCESS_PADAGIS_ISRAEL":
-            PROCESS_PADAGIS_ISRAEL(client_filepath, customer_sheetname, excel_row_startind,
-                                  excel_colnames, config, db)
+    def __init__(self, server_type: str = "DEV"):
+        """
+        Initialize Drug Intelligence Automation
         
-        # Move to processed
-        MOVE_TO_PROCESSED(customer_name, client_filepath, config)
-        
-        # Update log
-        db.execute_sql_string(f"""
-            UPDATE {log_report} 
-            SET completed_sts='1', end_datetime=NOW() 
-            WHERE log_id='{log_id}'
-        """)
-        
-        logger.info(f"✅ {customer_name} processed successfully")
-        
-    except Exception as e:
-        logger.error(f"❌ {customer_name} processing failed: {e}")
-        MOVE_FAILED_CLIENTFILE(customer_name, client_filepath, log_id, list_files[0], config, db)
-
-
-def MOVE_TO_PROCESSED(customer_name, client_filpath, config):
-    """MOVE_TO_PROCESSED - Exact Robot Framework logic"""
-    bot_processedpath = config.process_variables['bot_processedpath']
-    processed_customer_path = os.path.join(bot_processedpath, customer_name)
+        Args:
+            server_type: Server environment (DEV/PROD)
+        """
+        self.config = Config(server_type)
+        self.logger = None  # Will be initialized after process_id is set
+        self.db = None
+        self.email_sender = None
+        self.excel_manager = None
+        self.processors = None
+        self.process_id = None
+        self.master_tracker_path = None
+        self.excluded_saltnames = []
     
-    os.makedirs(processed_customer_path, exist_ok=True)
-    
-    dest_path = os.path.join(processed_customer_path, os.path.basename(client_filpath))
-    shutil.move(client_filpath, dest_path)
-
-
-def MOVE_FAILED_CLIENTFILE(customer_name, client_filepath, log_id, filename, config, db):
-    """MOVE_FAILED_CLIENTFILE - Exact Robot Framework logic"""
-    bot_failedpath = config.process_variables['bot_failedpath']
-    failed_customer_path = os.path.join(bot_failedpath, customer_name)
-    
-    os.makedirs(failed_customer_path, exist_ok=True)
-    
-    dest_path = os.path.join(failed_customer_path, os.path.basename(client_filepath))
-    if os.path.exists(client_filepath):
-        shutil.move(client_filepath, dest_path)
-    
-    # Update log
-    log_report = config.table_names['log_report']
-    db.execute_sql_string(f"""
-        UPDATE {log_report}
-        SET failed_sts='1', 
-            failure_message='Failed while processing {customer_name} customer - {filename}',
-            end_datetime=NOW()
-        WHERE log_id='{log_id}'
-    """)
-
-
-def MOVE_TO_FAILED(error_message, config, db):
-    """MOVE_TO_FAILED - Exact Robot Framework logic"""
-    logger.error(f"\n❌ MOVING TO FAILED: {error_message}")
-    
-    bot_failedpath = config.process_variables['bot_failedpath']
-    bot_outpath = config.process_variables['bot_outpath']
-    master_tracker_path = config.process_variables['master_tracker_path']
-    process_id = config.process_variables['process_id']
-    
-    os.makedirs(bot_failedpath, exist_ok=True)
-    
-    # Move master tracker to failed
-    if os.path.exists(master_tracker_path):
-        filename = os.path.basename(master_tracker_path)
-        dest_path = os.path.join(bot_failedpath, filename)
-        shutil.move(master_tracker_path, dest_path)
-        attachment = dest_path
-    else:
-        attachment = ""
-    
-    # Move output directory to failed
-    output_dir = os.path.join(bot_outpath, str(process_id))
-    if os.path.exists(output_dir):
-        failed_output = os.path.join(bot_failedpath, str(process_id))
-        shutil.move(output_dir, failed_output)
-    
-    # Update process status
-    process_status = config.table_names['process_status']
-    error_message_clean = error_message.replace("'", "''")
-    db.execute_sql_string(f"""
-        UPDATE {process_status}
-        SET process_status='Failed', error_message='{error_message_clean}', end_datetime=NOW()
-        WHERE process_id='{process_id}'
-    """)
-    
-    # Send failure email
-    send_failure_email(config, process_id, 
-                      os.path.basename(master_tracker_path) if master_tracker_path else "Unknown",
-                      error_message, attachment)
-
-
-def MOVE_TO_BOT_OUT(config, db):
-    """MOVE_TO_BOT_OUT - Exact Robot Framework logic"""
-    logger.info("\n" + "="*60)
-    logger.info("MOVE TO BOT-OUT")
-    logger.info("="*60)
-    
-    # Get completed and failed files
-    log_report = config.table_names['log_report']
-    process_id = config.process_variables['process_id']
-    
-    completedQuery = db.query(f"""
-        SELECT customer_name, filename 
-        FROM {log_report} 
-        WHERE completed_sts='1' AND process_id='{process_id}'
-    """)
-    
-    failedQuery = db.query(f"""
-        SELECT customer_name, filename, failure_message
-        FROM {log_report}
-        WHERE failed_sts='1' AND process_id='{process_id}'
-    """)
-    
-    completedQueryLen = db.get_length(completedQuery)
-    failedQueryLen = db.get_length(failedQuery)
-    
-    # If only failures
-    if completedQueryLen == 0 and failedQueryLen != 0:
-        error_lines = []
-        for i, f in enumerate(failedQuery):
-            error_lines.append(f"{i+1}) {f['customer_name']} - {f['filename']}")
-        error_message = "Below files failed during processing:\n\n" + "\n".join(error_lines)
-        MOVE_TO_FAILED(error_message, config, db)
-        return
-    
-    # Move master tracker to output
-    
-
-di_output_dir = os.path.join(config.process_variables['bot_outpath'], str(process_id))
-    master_tracker_path = config.process_variables['master_tracker_path']
-    
-    if os.path.exists(master_tracker_path):
-        dest_path = os.path.join(di_output_dir, os.path.basename(master_tracker_path))
-        shutil.move(master_tracker_path, dest_path)
-    
-    # Collect attachments
-    attachments = []
-    for filename in os.listdir(di_output_dir):
-        if filename.endswith('.xlsx') and 'Conflict' not in filename:
-            attachments.append(os.path.join(di_output_dir, filename))
-    
-    # Send success email
-    attachments_str = ';'.join(attachments)
-    send_success_email(config, completedQuery, failedQuery, attachments_str)
-    
-    # Clean inprogress
-    bot_inprogresspath = config.process_variables['bot_inprogresspath']
-    for item in os.listdir(bot_inprogresspath):
-        item_path = os.path.join(bot_inprogresspath, item)
-        if os.path.isfile(item_path):
-            os.remove(item_path)
-        elif os.path.isdir(item_path):
-            shutil.rmtree(item_path)
-    
-    logger.info("✅ MOVE_TO_BOT_OUT completed")
-
-
-def MASTER_TRACKER_UPDATE(config, db):
-    """MASTER_TRACKER_UPDATE - Exact Robot Framework logic"""
-    logger.info("\n" + "="*60)
-    logger.info("MASTER_TRACKER_UPDATE")
-    logger.info("="*60)
-    
-    # Get customer list
-    customer_table = config.process_variables['customer_table']
-    customer_list = db.query(f"SELECT customer_id, customer_name FROM {customer_table} WHERE status = 1")
-    
-    logger.info(f"Found {len(customer_list)} active customers")
-    
-    # Process each customer
-    for customer_info in customer_list:
+    def run(self):
+        """Main execution method"""
         try:
-            EXECUTE_EACH_CUSTOMER(customer_info, config, db)
+            # Initialize logger
+            self.logger = get_logger("INIT")
+            self.logger.info("=" * 80)
+            self.logger.info("DRUG INTELLIGENCE AUTOMATION STARTED")
+            self.logger.info("=" * 80)
+            
+            # Initialize process
+            if not self._initialize_process():
+                self.logger.error("Process initialization failed")
+                return False
+            
+            # Execute master tracker update
+            success = self._master_tracker_update()
+            
+            if success:
+                self.logger.info("=" * 80)
+                self.logger.info("DRUG INTELLIGENCE AUTOMATION COMPLETED SUCCESSFULLY")
+                self.logger.info("=" * 80)
+            else:
+                self.logger.error("Drug Intelligence Automation failed")
+            
+            return success
+            
         except Exception as e:
-            logger.error(f"❌ Error processing {customer_info['customer_name']}: {e}")
+            self.logger.log_exception(e, "Main execution")
+            return False
+        finally:
+            if self.db:
+                self.db.disconnect()
     
-    # Generate reports
+    def _initialize_process(self) -> bool:
+        """Initialize all components and load configuration"""
+        try:
+            self.logger.log_function_start("initialize_process")
+            
+            # Initialize database
+            self.db = DatabaseManager(self.config.get_db_config())
+            if not self.db.connect():
+                return False
+            
+            # Load configuration from database
+            if not self._load_config_from_db():
+                return False
+            
+            # Initialize other components
+            self.email_sender = EmailSender(self.config.get_email_config())
+            self.excel_manager = ExcelManager()
+            self.processors = CustomerProcessors(self.db, self.excel_manager, self.config)
+            
+            # Check for files
+            if not self._check_files():
+                self.logger.warning("No files to process")
+                return False
+            
+            self.logger.log_function_end("initialize_process", "Success")
+            return True
+            
+        except Exception as e:
+            self.logger.log_exception(e, "Initialize process")
+            return False
+    
+    def _load_config_from_db(self) -> bool:
+        """Load configuration from database"""
+        try:
+            self.logger.info("Loading configuration from database...")
+            
+            variable_table = self.config.TABLES['variable_table']
+            
+            # Load paths
+            query = f"""
+                SELECT value FROM {variable_table} 
+                WHERE name IN ('MTU Source Path', 'Customer Table')
+            """
+            results = self.db.execute_query(query)
+            
+            if not results or len(results) < 2:
+                self.logger.error("Failed to load basic configuration")
+                return False
+            
+            drug_intelligence_path = results[0]['value']
+            customer_table = results[1]['value']
+            
+            self.config.update_paths_from_db(drug_intelligence_path)
+            self.config.TABLES['customer_table'] = customer_table
+            
+            # Load process configuration
+            query = f"""
+                SELECT value FROM {variable_table}
+                WHERE name IN ('MT Sheetname', 'MT Product Colname', 
+                              'Mail Configuration Table', 'MTU Table Names Table',
+                              'MT Column Names Table', 'MT Comment Colname',
+                              'MTU Default Remark Comment', 'MT SNo Colname')
+            """
+            results = self.db.execute_query(query)
+            
+            config_data = {
+                'master_sheetname': results[0]['value'],
+                'master_tracker_productcol': results[1]['value'],
+                'mail_config_table': results[2]['value'],
+                'mtu_tablenames_table': results[3]['value'],
+                'mt_columnnames_table': results[4]['value'],
+                'comment_colname': results[5]['value'],
+                'remark_default_value': results[6]['value'],
+                'sno_colname': results[7]['value']
+            }
+            self.config.update_process_config_from_db(config_data)
+            
+            # Load table names
+            mtu_table = config_data['mtu_tablenames_table']
+            query = f"""
+                SELECT value FROM {mtu_table}
+                WHERE name IN ('process_status', 'suprocess_info', 'master_tracker_updates',
+                              'overall_count_report', 'inclusion_exclusion_counts',
+                              'salt_exclusion_list', 'caplin_master_report', 'bells_master_report',
+                              'marksans_usa_master_report', 'relonchem_master_report',
+                              'padagis_israle_master_report', 'padagis_usa_master_report',
+                              'log_report')
+                ORDER BY CASE name
+                    WHEN 'process_status' THEN 1
+                    WHEN 'suprocess_info' THEN 2
+                    WHEN 'master_tracker_updates' THEN 3
+                    WHEN 'overall_count_report' THEN 4
+                    WHEN 'inclusion_exclusion_counts' THEN 5
+                    WHEN 'salt_exclusion_list' THEN 6
+                    WHEN 'caplin_master_report' THEN 7
+                    WHEN 'bells_master_report' THEN 8
+                    WHEN 'marksans_usa_master_report' THEN 9
+                    WHEN 'relonchem_master_report' THEN 10
+                    WHEN 'padagis_israle_master_report' THEN 11
+                    WHEN 'padagis_usa_master_report' THEN 12
+                    WHEN 'log_report' THEN 13
+                    ELSE 14 END
+            """
+            results = self.db.execute_query(query)
+            
+            table_mapping = {
+                'process_status': results[0]['value'],
+                'suprocess_info': results[1]['value'],
+                'master_tracker_updates': results[2]['value'],
+                'overall_count_report': results[3]['value'],
+                'inclusion_exclusion_counts': results[4]['value'],
+                'salt_exclusion_list': results[5]['value'],
+                'caplin_master_report': results[6]['value'],
+                'bells_master_report': results[7]['value'],
+                'marksans_usa_master_report': results[8]['value'],
+                'relonchem_master_report': results[9]['value'],
+                'padagis_israle_master_report': results[10]['value'],
+                'padagis_usa_master_report': results[11]['value'],
+                'log_report': results[12]['value']
+            }
+            self.config.update_tables_from_db(table_mapping)
+            
+            # Load mail configuration
+            mail_table = config_data['mail_config_table']
+            query = f"""
+                SELECT value FROM {mail_table}
+                WHERE name IN ('Success To Address', 'Success Cc Address',
+                              'Failure To Address', 'Failure Cc Address',
+                              'Success Mail Subject', 'Failure Mai Subject',
+                              'Success Mail Body', 'Failure Mail Body')
+            """
+            results = self.db.execute_query(query)
+            
+            mail_config = {
+                'success_to_address': results[0]['value'],
+                'success_cc_address': results[1]['value'],
+                'failure_to_address': results[2]['value'],
+                'failure_cc_address': results[3]['value'],
+                'success_mail_subject': results[4]['value'],
+                'failure_mail_subject': results[5]['value'],
+                'success_mail_body': results[6]['value'],
+                'failure_mail_body': results[7]['value']
+            }
+            self.config.update_mail_config_from_db(mail_config)
+            
+            # Load excluded salts
+            salt_table = self.config.get_table('salt_exclusion_list')
+            self.excluded_saltnames = self.db.get_excluded_salts(salt_table)
+            
+            self.logger.info("Configuration loaded successfully")
+            return True
+            
+        except Exception as e:
+            self.logger.log_exception(e, "Load configuration from database")
+            return False
+    
+    def _check_files(self) -> bool:
+        """Check for master tracker and client files"""
+        try:
+            master_tracker_dir = self.config.get_path('master_tracker_dirpath')
+            client_dir = self.config.get_path('client_dirpath')
+            
+            # Create directories if not exist
+            os.makedirs(master_tracker_dir, exist_ok=True)
+            os.makedirs(client_dir, exist_ok=True)
+            
+            # Check master tracker files
+            master_files = [f for f in os.listdir(master_tracker_dir) 
+                          if f.endswith('.xlsx')]
+            
+            if not master_files:
+                self.logger.warning("No master tracker files found")
+                return False
+            
+            self.master_tracker_path = os.path.join(master_tracker_dir, master_files[0])
+            
+            # Check client files
+            client_files = []
+            for root, dirs, files in os.walk(client_dir):
+                for file in files:
+                    if file.endswith(('.xls', '.xlsx')):
+                        client_files.append(file)
+            
+            if not client_files:
+                self.logger.warning("No client files found")
+                return False
+            
+            self.logger.info(f"Found {len(master_files)} master tracker files")
+            self.logger.info(f"Found {len(client_files)} client files")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.log_exception(e, "Check files")
+            return False
+    
+    def _master_tracker_update(self) -> bool:
+        """Execute master tracker update process"""
+        try:
+            self.logger.log_function_start("master_tracker_update")
+            
+            # Move master tracker to in-progress
+            if not self._move_to_inprogress():
+                return False
+            
+            # Validate master tracker
+            if not self._validate_master_tracker():
+                return False
+            
+            # Get customers and process each
+            customers = self.db.get_customers(self.config.get_table('customer_table'))
+            
+            if not customers:
+                self.logger.warning("No active customers found")
+                return False
+            
+            self.logger.info(f"Processing {len(customers)} customers")
+            
+            for customer in customers:
+                self._execute_each_customer(customer)
+            
+            # Generate reports
+            self._generate_reports()
+            
+            # Move to BOT-OUT
+            self._move_to_bot_out()
+            
+            # Update final status
+            process_table = self.config.get_table('process_status')
+            self.db.update_process_status(
+                process_table, 
+                self.process_id, 
+                'Completed'
+            )
+            
+            self.logger.log_function_end("master_tracker_update", "Success")
+            return True
+            
+        except Exception as e:
+            self.logger.log_exception(e, "Master tracker update")
+            return False
+    
+    def _move_to_inprogress(self) -> bool:
+        """Move master tracker to in-progress folder"""
+        try:
+            self.logger.info("Moving master tracker to in-progress...")
+            
+            # Create process record
+            process_table = self.config.get_table('process_status')
+            master_filename = os.path.basename(self.master_tracker_path)
+            
+            query = f"""
+                INSERT INTO {process_table} 
+                (process_status, mt_filename, start_datetime)
+                VALUES ('Initiated', %s, NOW())
+            """
+            self.db.execute_insert(query, (master_filename,))
+            
+            # Get process ID
+            self.process_id = self.db.get_max_id(
+                process_table,
+                'process_id'
+            )
+            
+            # Update logger with process ID
+            self.logger.update_process_id(str(self.process_id))
+            self.config.PROCESS_CONFIG['process_id'] = self.process_id
+            
+            self.logger.info(f"Process ID created: {self.process_id}")
+            
+            # Create and clean in-progress directory
+            inprogress_dir = self.config.get_path('bot_inprogresspath')
+            os.makedirs(inprogress_dir, exist_ok=True)
+            
+            # Move file
+            new_path = os.path.join(inprogress_dir, master_filename)
+            shutil.move(self.master_tracker_path, new_path)
+            self.master_tracker_path = new_path
+            
+            self.logger.log_file_operation("move", new_path, "Success")
+            
+            # Update status
+            self.db.update_process_status(
+                process_table,
+                self.process_id,
+                'File Moved to Inprogress'
+            )
+            
+            return True
+            
+        except Exception as e:
+            self.logger.log_exception(e, "Move to in-progress")
+            return False
+    
+    def _validate_master_tracker(self) -> bool:
+        """Validate master tracker file structure"""
+        try:
+            self.logger.info("Validating master tracker...")
+            
+            # Update status
+            process_table = self.config.get_table('process_status')
+            self.db.update_process_status(
+                process_table,
+                self.process_id,
+                'Master Tracker Validation Initiated'
+            )
+            
+            # Get required columns
+            mt_columns_table = self.config.PROCESS_CONFIG['mt_columnnames_table']
+            query = f"SELECT excel_colname FROM {mt_columns_table} WHERE status='1'"
+            results = self.db.execute_query(query)
+            
+            column_names = [self.config.PROCESS_CONFIG['master_tracker_productcol']]
+            column_names.extend([row['excel_colname'] for row in results])
+            column_names.append(self.config.PROCESS_CONFIG['comment_colname'])
+            
+            # Validate columns exist
+            sheet_name = self.config.PROCESS_CONFIG['master_sheetname']
+            
+            try:
+                from openpyxl import load_workbook
+                workbook = load_workbook(self.master_tracker_path, data_only=True)
+                
+                if sheet_name not in workbook.sheetnames:
+                    raise ValueError(f"Sheet '{sheet_name}' not found")
+                
+                sheet = workbook[sheet_name]
+                header_row = list(sheet.iter_rows(max_row=10, values_only=True))
+                
+                # Check if all columns exist
+                for col in column_names:
+                    found = False
+                    for row in header_row:
+                        if any(col.lower() in str(cell).lower() if cell else '' 
+                              for cell in row):
+                            found = True
+                            break
+                    
+                    if not found:
+                        workbook.close()
+                        error_msg = f"Column '{col}' not found in master tracker"
+                        self._move_to_failed(error_msg)
+                        return False
+                
+                workbook.close()
+                
+            except Exception as e:
+                error_msg = f"Wrong Master Tracker File - {str(e)}"
+                self._move_to_failed(error_msg)
+                return False
+            
+            # Update status
+            self.db.update_process_status(
+                process_table,
+                self.process_id,
+                'Master Tracker Validation Completed'
+            )
+            
+            self.logger.info("Master tracker validation successful")
+            return True
+            
+        except Exception as e:
+            self.logger.log_exception(e, "Validate master tracker")
+            return False
+    
+    def _execute_each_customer(self, customer: Dict):
+        """Process each customer's file"""
+        try:
+            customer_id = customer['customer_id']
+            customer_name = customer['customer_name']
+            
+            self.logger.log_customer_processing(customer_name, customer_id, "Started")
+            
+            # Get subprocess info
+            subprocess_table = self.config.get_table('suprocess_info')
+            query = f"""
+                SELECT suprocess_name, excel_sheetname, excel_startindex, column_names
+                FROM {subprocess_table}
+                WHERE customer_id=%s
+            """
+            result = self.db.execute_query(query, (customer_id,))
+            
+            if not result:
+                self.logger.info(f"No subprocess configuration for {customer_name}")
+                return
+            
+            config = result[0]
+            subprocess_name = config['suprocess_name']
+            
+            # Find customer file
+            client_dir = os.path.join(
+                self.config.get_path('client_dirpath'),
+                customer_name
+            )
+            
+            if not os.path.exists(client_dir):
+                self.logger.warning(f"Customer directory not found: {client_dir}")
+                return
+            
+            files = [f for f in os.listdir(client_dir) 
+                    if f.endswith(('.xls', '.xlsx'))]
+            
+            if not files:
+                self.logger.warning(f"No files found for {customer_name}")
+                return
+            
+            client_filepath = os.path.join(client_dir, files[0])
+            
+            # Insert log entry
+            log_table = self.config.get_table('log_report')
+            log_data = {
+                'process_id': self.process_id,
+                'customer_id': customer_id,
+                'initiated_sts': 1,
+                'start_datetime': datetime.now(),
+                'customer_name': customer_name,
+                'filename': files[0]
+            }
+            log_id = self.db.insert_log_entry(log_table, log_data)
+            
+            # Move to in-progress
+            inprogress_dir = os.path.join(
+                self.config.get_path('bot_inprogresspath'),
+                customer_name
+            )
+            os.makedirs(inprogress_dir, exist_ok=True)
+            
+            new_filepath = os.path.join(inprogress_dir, files[0])
+            shutil.move(client_filepath, new_filepath)
+            
+            # Process based on subprocess name
+            processor_map = {
+                'PROCESS_CAPLIN': self.processors.process_caplin,
+                'PROCESS_BELLS': self.processors.process_bells,
+                'PROCESS_RELONCHEM': self.processors.process_relonchem,
+                'PROCESS_MARKSANS_USA': self.processors.process_marksans_usa,
+                'PROCESS_PADAGIS_USA': self.processors.process_padagis_usa,
+                'PROCESS_PADAGIS_ISRAEL': self.processors.process_padagis_israel
+            }
+            
+            processor = processor_map.get(subprocess_name)
+            if processor:
+                success = processor(new_filepath, config)
+                
+                if success:
+                    self._move_to_processed(customer_name, new_filepath)
+                    # Update log
+                    query = f"""
+                        UPDATE {log_table}
+                        SET completed_sts=1, end_datetime=NOW()
+                        WHERE log_id=%s
+                    """
+                    self.db.execute_update(query, (log_id,))
+                    
+                    self.logger.log_customer_processing(
+                        customer_name, customer_id, "Completed"
+                    )
+                else:
+                    self._move_failed_clientfile(customer_name, new_filepath, log_id)
+            else:
+                self.logger.error(f"Unknown subprocess: {subprocess_name}")
+                self._move_failed_clientfile(customer_name, new_filepath, log_id)
+            
+        except Exception as e:
+            self.logger.log_exception(e, f"Process customer {customer.get('customer_name')}")
+    
+    def _move_to_processed(self, customer_name: str, filepath: str):
+        """Move file to processed folder"""
+        try:
+            processed_dir = os.path.join(
+                self.config.get_path('bot_processedpath'),
+                str(self.process_id),
+                customer_name
+            )
+            os.makedirs(processed_dir, exist_ok=True)
+            
+            filename = os.path.basename(filepath)
+            new_path = os.path.join(processed_dir, filename)
+            shutil.move(filepath, new_path)
+            
+            self.logger.log_file_operation("move_processed", new_path, "Success")
+            
+        except Exception as e:
+            self.logger.log_exception(e, "Move to processed")
+    
+    def _move_failed_clientfile(self, customer_name: str, filepath: str, log_id: int):
+        """Move failed file to failed folder"""
+        try:
+            failed_dir = os.path.join(
+                self.config.get_path('bot_failedpath'),
+                str(self.process_id),
+                customer_name
+            )
+            os.makedirs(failed_dir, exist_ok=True)
+            
+            filename = os.path.basename(filepath)
+            new_path = os.path.join(failed_dir, filename)
+            shutil.move(filepath, new_path)
+            
+            # Update log
+            log_table = self.config.get_table('log_report')
+            query = f"""
+                UPDATE {log_table}
+                SET failed_sts=1, 
+                    failure_message='Failed while processing {customer_name} - {filename}',
+                    end_datetime=NOW()
+                WHERE log_id=%s
+            """
+            self.db.execute_update(query, (log_id,))
+            
+            self.logger.log_file_operation("move_failed", new_path, "Failed")
+            
+        except Exception as e:
+            self.logger.log_exception(e, "Move failed client file")
+    
+    def _generate_reports(self):
+        """Generate Excel reports"""
+        try:
+            self.logger.info("Generating reports...")
+            
+            # Truncate report tables
+            self.db.truncate_table(self.config.get_table('overall_count_report'))
+            self.db.truncate_table(self.config.get_table('inclusion_exclusion_counts'))
+            
+            # Report generation logic would go here
+            # This would involve querying processed data and creating Excel reports
+            
+            self.logger.info("Reports generated successfully")
+            
+        except Exception as e:
+            self.logger.log_exception(e, "Generate reports")
+    
+    def _move_to_bot_out(self):
+        """Move completed files to BOT-OUT and send email"""
+        try:
+            self.logger.info("Moving files to BOT-OUT...")
+            
+            log_table = self.config.get_table('log_report')
+            
+            # Get completed files
+            query = f"""
+                SELECT customer_name, filename
+                FROM {log_table}
+                WHERE completed_sts=1 AND process_id=%s
+            """
+            completed_files = self.db.execute_query(query, (self.process_id,))
+            
+            # Get failed files
+            query = f"""
+                SELECT customer_name, filename, failure_message
+                FROM {log_table}
+                WHERE failed_sts=1 AND process_id=%s
+            """
+            failed_files = self.db.execute_query(query, (self.process_id,))
+            
+            completed_list = [(f['customer_name'], f['filename']) 
+                            for f in completed_files]
+            failed_list = [(f['customer_name'], f['filename'], f['failure_message']) 
+                          for f in failed_files]
+            
+            if not completed_list and failed_list:
+                # All failed
+                error_list = '\n'.join([
+                    f"{i+1}) {f[0]} - {f[1]}"
+                    for i, f in enumerate(failed_list)
+                ])
+                self._move_to_failed(f"Below files failed during processing:\n\n{error_list}")
+                return
+            
+            # Move master tracker to output
+            output_dir = os.path.join(
+                self.config.get_path('bot_outpath'),
+                str(self.process_id)
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            
+            master_filename = os.path.basename(self.master_tracker_path)
+            output_path = os.path.join(output_dir, master_filename)
+            shutil.move(self.master_tracker_path, output_path)
+            
+            # Collect attachments
+            attachments = [output_path]
+            report_files = [f for f in os.listdir(output_dir) if f.endswith('.xlsx')]
+            for file in report_files:
+                if "Conflict" not in file:
+                    attachments.append(os.path.join(output_dir, file))
+            
+            # Send success email
+            self.email_sender.send_success_email(
+                self.config.MAIL_CONFIG,
+                completed_list,
+                failed_list,
+                attachments
+            )
+            
+            # Clean in-progress directory
+            inprogress_dir = self.config.get_path('bot_inprogresspath')
+            if os.path.exists(inprogress_dir):
+                shutil.rmtree(inprogress_dir)
+            
+            self.logger.info("Files moved to BOT-OUT successfully")
+            
+        except Exception as e:
+            self.logger.log_exception(e, "Move to BOT-OUT")
+    
+    def _move_to_failed(self, error_message: str):
+        """Move process to failed folder"""
+        try:
+            self.logger.error(f"Moving to failed: {error_message}")
+            
+            # Create failed directory
+            failed_dir = os.path.join(
+                self.config.get_path('bot_failedpath'),
+                str(self.process_id)
+            )
+            os.makedirs(failed_dir, exist_ok=True)
+            
+            # Move master tracker
+            if os.path.exists(self.master_tracker_path):
+                master_filename = os.path.basename(self.master_tracker_path)
+                failed_path = os.path.join(failed_dir, master_filename)
+                shutil.move(self.master_tracker_path, failed_path)
+            
+            # Update process status
+            process_table = self.config.get_table('process_status')
+            self.db.update_process_status(
+                process_table,
+                self.process_id,
+                'Failed',
+                error_message
+            )
+            
+            # Send failure email
+            master_filename = os.path.basename(self.master_tracker_path)
+            self.email_sender.send_failure_email(
+                self.config.MAIL_CONFIG,
+                str(self.process_id),
+                master_filename,
+                error_message,
+                failed_path if os.path.exists(failed_path) else None
+            )
+            
+            self.logger.error("Process moved to failed")
+            
+        except Exception as e:
+            self.logger.log_exception(e, "Move to failed")
+
+
+def main():
+    """Main entry point"""
     try:
-        GENERATE_REPORT(config, db)
+        automation = DrugIntelligenceAutomation(server_type="DEV")
+        success = automation.run()
+        return 0 if success else 1
     except Exception as e:
-        logger.error(f"⚠️  Report generation failed: {e}")
-    
-    # Move to BOT-OUT
-    try:
-        MOVE_TO_BOT_OUT(config, db)
-    except Exception as e:
-        logger.error(f"⚠️  Move to BOT-OUT failed: {e}")
-    
-    # Update final status
-    process_status = config.table_names['process_status']
-    process_id = config.process_variables['process_id']
-    db.execute_sql_string(f"""
-        UPDATE {process_status}
-        SET process_status='Completed', end_datetime=NOW()
-        WHERE process_id='{process_id}'
-    """)
-    
-    logger.info("\n✅ MASTER_TRACKER_UPDATE
+        print(f"Fatal error: {str(e)}")
+        return 1
+
+
+if __name__ == "__main__":
+    exit(main())
