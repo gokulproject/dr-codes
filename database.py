@@ -1,317 +1,462 @@
 """
-Database module for Drug Intelligence Automation
-Handles all database connections and operations
+Database Connection Manager - Drug Intelligence Automation
+Handles all MySQL database operations using pymysql
+Implements connection pooling, error handling, and auto-reconnect
 """
 
 import pymysql
-from typing import List, Dict, Any, Optional, Tuple
+from pymysql.cursors import DictCursor
+from typing import Optional, List, Tuple, Any, Dict
+import time
 from contextlib import contextmanager
-from logger import get_logger
 
 
 class DatabaseManager:
-    """Database connection and operations manager"""
+    """
+    Manages MySQL database connections and operations
+    Uses pymysql library for all database interactions
+    """
     
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], logger=None):
         """
-        Initialize database manager
+        Initialize database manager with configuration
         
         Args:
             config: Database configuration dictionary
+            logger: Logger instance for logging database operations
         """
         self.config = config
-        self.connection = None
-        self.cursor = None
-        self.logger = get_logger()
-    
+        self.logger = logger
+        self.connection: Optional[pymysql.connections.Connection] = None
+        self.is_connected = False
+        self.max_retries = 3
+        self.retry_delay = 2  # seconds
+        
     def connect(self) -> bool:
         """
-        Establish database connection
+        Establish connection to MySQL database
         
         Returns:
-            bool: True if connection successful
+            bool: True if connection successful, False otherwise
         """
         try:
-            self.logger.info("Connecting to database...")
-            self.connection = pymysql.connect(
-                host=self.config['host'],
-                port=self.config['port'],
-                user=self.config['username'],
-                password=self.config['password'],
-                database=self.config['database'],
-                charset='utf8mb4',
-                cursorclass=pymysql.cursors.DictCursor
-            )
-            self.cursor = self.connection.cursor()
-            self.logger.info("Database connection established successfully")
-            return True
-        except Exception as e:
-            self.logger.log_exception(e, "Database connection")
-            return False
-    
-    def disconnect(self):
-        """Close database connection"""
-        try:
-            if self.cursor:
-                self.cursor.close()
+            if self.logger:
+                self.logger.info("⏳ Attempting to connect to database...")
+            
+            # Close existing connection if any
             if self.connection:
-                self.connection.close()
-            self.logger.info("Database connection closed")
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+            
+            # Create new connection
+            self.connection = pymysql.connect(
+                host=self.config.get('host'),
+                port=self.config.get('port', 3306),
+                user=self.config.get('username'),
+                password=self.config.get('password'),
+                database=self.config.get('database'),
+                charset=self.config.get('charset', 'utf8mb4'),
+                cursorclass=DictCursor,
+                autocommit=self.config.get('autocommit', False),
+                connect_timeout=30,
+                read_timeout=30,
+                write_timeout=30
+            )
+            
+            # Test connection
+            with self.connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+            
+            self.is_connected = True
+            
+            if self.logger:
+                self.logger.success(f"✅ Database connected successfully to {self.config.get('database')}")
+            
+            return True
+            
+        except pymysql.MySQLError as e:
+            self.is_connected = False
+            error_msg = f"MySQL Error: {str(e)}"
+            if self.logger:
+                self.logger.error(f"❌ Database connection failed - {error_msg}")
+            raise Exception(error_msg)
+            
         except Exception as e:
-            self.logger.log_exception(e, "Database disconnection")
+            self.is_connected = False
+            error_msg = f"Unexpected error during database connection: {str(e)}"
+            if self.logger:
+                self.logger.error(f"❌ {error_msg}")
+            raise Exception(error_msg)
     
-    @contextmanager
-    def transaction(self):
-        """Context manager for database transactions"""
+    def reconnect(self) -> bool:
+        """
+        Attempt to reconnect to database with retry logic
+        
+        Returns:
+            bool: True if reconnection successful
+        """
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                if self.logger:
+                    self.logger.warning(f"⏳ Reconnection attempt {attempt}/{self.max_retries}...")
+                
+                if self.connect():
+                    return True
+                    
+            except Exception as e:
+                if attempt < self.max_retries:
+                    if self.logger:
+                        self.logger.warning(f"⚠️ Reconnection attempt {attempt} failed, retrying in {self.retry_delay}s...")
+                    time.sleep(self.retry_delay)
+                else:
+                    if self.logger:
+                        self.logger.error(f"❌ All reconnection attempts failed: {str(e)}")
+                    return False
+        
+        return False
+    
+    def ensure_connection(self) -> bool:
+        """
+        Ensure database connection is active, reconnect if needed
+        
+        Returns:
+            bool: True if connection is active
+        """
         try:
-            yield self
-            self.connection.commit()
-            self.logger.debug("Transaction committed successfully")
+            if not self.connection or not self.is_connected:
+                return self.reconnect()
+            
+            # Ping to check if connection is alive
+            self.connection.ping(reconnect=True)
+            return True
+            
         except Exception as e:
-            self.connection.rollback()
-            self.logger.error(f"Transaction rolled back due to error: {str(e)}")
-            raise
+            if self.logger:
+                self.logger.warning(f"⚠️ Connection lost, attempting to reconnect: {str(e)}")
+            return self.reconnect()
     
-    def execute_query(self, query: str, params: Optional[Tuple] = None) -> List[Dict]:
+    def execute_query(self, query: str, params: Optional[Tuple] = None, fetch_results: bool = True) -> Optional[List]:
         """
         Execute SELECT query and return results
         
         Args:
-            query: SQL query string
-            params: Query parameters
-        
+            query: SQL SELECT query
+            params: Query parameters for parameterized queries
+            fetch_results: Whether to fetch and return results
+            
         Returns:
-            List of dictionaries containing query results
+            List of tuples containing query results, or None
         """
+        cursor = None
         try:
-            self.logger.log_database_operation("SELECT", "multiple", query[:100])
+            # Ensure connection is active
+            if not self.ensure_connection():
+                raise Exception("Database connection is not active")
+            
+            if self.logger:
+                self.logger.debug(f"ℹ️ Executing query: {query[:100]}...")
+            
+            cursor = self.connection.cursor()
+            
+            # Execute query with or without parameters
             if params:
-                self.cursor.execute(query, params)
+                cursor.execute(query, params)
             else:
-                self.cursor.execute(query)
-            results = self.cursor.fetchall()
-            self.logger.debug(f"Query returned {len(results)} rows")
-            return results
+                cursor.execute(query)
+            
+            # Fetch results if needed
+            if fetch_results:
+                results = cursor.fetchall()
+                
+                if self.logger:
+                    self.logger.debug(f"✅ Query executed successfully, {len(results)} rows fetched")
+                
+                # Convert DictCursor results to list of tuples for compatibility
+                if results and isinstance(results[0], dict):
+                    return [tuple(row.values()) for row in results]
+                
+                return results
+            else:
+                if self.logger:
+                    self.logger.debug("✅ Query executed successfully (no fetch)")
+                return None
+            
+        except pymysql.MySQLError as e:
+            error_msg = f"MySQL query execution error: {str(e)}"
+            if self.logger:
+                self.logger.error(f"❌ {error_msg}")
+                self.logger.error(f"Query: {query}")
+            raise Exception(error_msg)
+            
         except Exception as e:
-            self.logger.log_exception(e, f"Query execution: {query[:100]}")
-            raise
+            error_msg = f"Unexpected error during query execution: {str(e)}"
+            if self.logger:
+                self.logger.error(f"❌ {error_msg}")
+            raise Exception(error_msg)
+            
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
     
     def execute_update(self, query: str, params: Optional[Tuple] = None) -> int:
         """
-        Execute INSERT/UPDATE/DELETE query
+        Execute INSERT, UPDATE, DELETE queries
         
         Args:
-            query: SQL query string
-            params: Query parameters
-        
+            query: SQL query (INSERT/UPDATE/DELETE)
+            params: Query parameters for parameterized queries
+            
         Returns:
-            Number of affected rows
+            int: Number of affected rows
         """
+        cursor = None
         try:
-            operation = query.strip().split()[0].upper()
-            self.logger.log_database_operation(operation, "table", query[:100])
+            # Ensure connection is active
+            if not self.ensure_connection():
+                raise Exception("Database connection is not active")
             
+            if self.logger:
+                self.logger.debug(f"ℹ️ Executing update: {query[:100]}...")
+            
+            cursor = self.connection.cursor()
+            
+            # Execute query
             if params:
-                affected_rows = self.cursor.execute(query, params)
+                affected_rows = cursor.execute(query, params)
             else:
-                affected_rows = self.cursor.execute(query)
+                affected_rows = cursor.execute(query)
             
+            # Commit the transaction
             self.connection.commit()
-            self.logger.debug(f"{operation} affected {affected_rows} rows")
+            
+            if self.logger:
+                self.logger.debug(f"✅ Update executed successfully, {affected_rows} rows affected")
+            
             return affected_rows
+            
+        except pymysql.MySQLError as e:
+            # Rollback on error
+            if self.connection:
+                try:
+                    self.connection.rollback()
+                except Exception:
+                    pass
+            
+            error_msg = f"MySQL update execution error: {str(e)}"
+            if self.logger:
+                self.logger.error(f"❌ {error_msg}")
+                self.logger.error(f"Query: {query}")
+            raise Exception(error_msg)
+            
         except Exception as e:
-            self.connection.rollback()
-            self.logger.log_exception(e, f"Update execution: {query[:100]}")
-            raise
+            # Rollback on error
+            if self.connection:
+                try:
+                    self.connection.rollback()
+                except Exception:
+                    pass
+            
+            error_msg = f"Unexpected error during update execution: {str(e)}"
+            if self.logger:
+                self.logger.error(f"❌ {error_msg}")
+            raise Exception(error_msg)
+            
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
     
-    def execute_insert(self, query: str, params: Optional[Tuple] = None) -> int:
+    def execute_many(self, query: str, data: List[Tuple]) -> int:
         """
-        Execute INSERT query and return last insert ID
+        Execute batch INSERT/UPDATE operations
         
         Args:
-            query: SQL query string
-            params: Query parameters
-        
+            query: SQL query template
+            data: List of tuples containing parameter values
+            
         Returns:
-            Last inserted ID
+            int: Total number of affected rows
+        """
+        cursor = None
+        try:
+            if not self.ensure_connection():
+                raise Exception("Database connection is not active")
+            
+            if self.logger:
+                self.logger.debug(f"ℹ️ Executing batch operation with {len(data)} records...")
+            
+            cursor = self.connection.cursor()
+            affected_rows = cursor.executemany(query, data)
+            self.connection.commit()
+            
+            if self.logger:
+                self.logger.debug(f"✅ Batch operation completed, {affected_rows} total rows affected")
+            
+            return affected_rows
+            
+        except pymysql.MySQLError as e:
+            if self.connection:
+                try:
+                    self.connection.rollback()
+                except Exception:
+                    pass
+            
+            error_msg = f"MySQL batch execution error: {str(e)}"
+            if self.logger:
+                self.logger.error(f"❌ {error_msg}")
+            raise Exception(error_msg)
+            
+        except Exception as e:
+            if self.connection:
+                try:
+                    self.connection.rollback()
+                except Exception:
+                    pass
+            
+            error_msg = f"Unexpected error during batch execution: {str(e)}"
+            if self.logger:
+                self.logger.error(f"❌ {error_msg}")
+            raise Exception(error_msg)
+            
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+    
+    @contextmanager
+    def transaction(self):
+        """
+        Context manager for database transactions
+        Automatically commits on success, rolls back on error
+        
+        Usage:
+            with db.transaction():
+                db.execute_update(query1)
+                db.execute_update(query2)
         """
         try:
-            self.logger.log_database_operation("INSERT", "table", query[:100])
-            if params:
-                self.cursor.execute(query, params)
-            else:
-                self.cursor.execute(query)
+            if not self.ensure_connection():
+                raise Exception("Database connection is not active")
+            
+            if self.logger:
+                self.logger.debug("ℹ️ Starting transaction...")
+            
+            yield self
+            
             self.connection.commit()
-            last_id = self.cursor.lastrowid
-            self.logger.debug(f"INSERT successful, last ID: {last_id}")
-            return last_id
+            
+            if self.logger:
+                self.logger.debug("✅ Transaction committed successfully")
+                
         except Exception as e:
-            self.connection.rollback()
-            self.logger.log_exception(e, f"Insert execution: {query[:100]}")
-            raise
+            if self.connection:
+                try:
+                    self.connection.rollback()
+                    if self.logger:
+                        self.logger.warning("⚠️ Transaction rolled back due to error")
+                except Exception:
+                    pass
+            raise e
     
     def truncate_table(self, table_name: str) -> bool:
         """
-        Truncate a table
+        Truncate a database table
         
         Args:
-            table_name: Name of table to truncate
-        
+            table_name: Name of the table to truncate
+            
         Returns:
             bool: True if successful
         """
         try:
+            if self.logger:
+                self.logger.info(f"⏳ Truncating table: {table_name}")
+            
             query = f"TRUNCATE TABLE {table_name}"
-            self.logger.log_database_operation("TRUNCATE", table_name, "")
             self.execute_update(query)
-            self.logger.info(f"Table {table_name} truncated successfully")
+            
+            if self.logger:
+                self.logger.success(f"✅ Table {table_name} truncated successfully")
+            
             return True
+            
         except Exception as e:
-            self.logger.log_exception(e, f"Truncate table: {table_name}")
-            return False
+            if self.logger:
+                self.logger.error(f"❌ Failed to truncate table {table_name}: {str(e)}")
+            raise
     
-    def get_max_id(self, table_name: str, id_column: str, 
-                   where_clause: str = "") -> Optional[int]:
+    def get_max_id(self, table_name: str, id_column: str, where_clause: str = "") -> Optional[int]:
         """
         Get maximum ID from a table
         
         Args:
-            table_name: Table name
-            id_column: ID column name
-            where_clause: Optional WHERE clause
-        
+            table_name: Name of the table
+            id_column: Name of the ID column
+            where_clause: Optional WHERE clause (without WHERE keyword)
+            
         Returns:
-            Maximum ID or None
+            int: Maximum ID value or None
         """
         try:
-            query = f"SELECT MAX({id_column}) as max_id FROM {table_name}"
             if where_clause:
-                query += f" WHERE {where_clause}"
+                query = f"SELECT MAX({id_column}) FROM {table_name} WHERE {where_clause}"
+            else:
+                query = f"SELECT MAX({id_column}) FROM {table_name}"
             
             result = self.execute_query(query)
-            if result and result[0]['max_id']:
-                return int(result[0]['max_id'])
-            return None
-        except Exception as e:
-            self.logger.log_exception(e, f"Get max ID from {table_name}")
-            return None
-    
-    def insert_log_entry(self, table_name: str, log_data: Dict[str, Any]) -> Optional[int]:
-        """
-        Insert log entry and return log ID
-        
-        Args:
-            table_name: Log table name
-            log_data: Dictionary of log data
-        
-        Returns:
-            Log ID or None
-        """
-        try:
-            columns = ', '.join(log_data.keys())
-            placeholders = ', '.join(['%s'] * len(log_data))
-            query = f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})"
             
-            self.cursor.execute(query, tuple(log_data.values()))
-            self.connection.commit()
-            
-            log_id = self.cursor.lastrowid
-            self.logger.info(f"Log entry inserted with ID: {log_id}")
-            return log_id
-        except Exception as e:
-            self.connection.rollback()
-            self.logger.log_exception(e, f"Insert log entry to {table_name}")
-            return None
-    
-    def update_process_status(self, process_status_table: str, process_id: int, 
-                             status: str, error_message: str = None) -> bool:
-        """
-        Update process status
-        
-        Args:
-            process_status_table: Process status table name
-            process_id: Process ID
-            status: New status
-            error_message: Optional error message
-        
-        Returns:
-            bool: True if successful
-        """
-        try:
-            if error_message:
-                query = f"""
-                    UPDATE {process_status_table} 
-                    SET process_status=%s, error_message=%s, end_datetime=NOW() 
-                    WHERE process_id=%s
-                """
-                params = (status, error_message, process_id)
+            if result and result[0] and result[0][0]:
+                return int(result[0][0])
             else:
-                query = f"""
-                    UPDATE {process_status_table} 
-                    SET process_status=%s 
-                    WHERE process_id=%s
-                """
-                params = (status, process_id)
-            
-            self.execute_update(query, params)
-            self.logger.log_process_status(status, f"Process ID: {process_id}")
-            return True
+                return None
+                
         except Exception as e:
-            self.logger.log_exception(e, "Update process status")
-            return False
+            if self.logger:
+                self.logger.error(f"❌ Failed to get max ID from {table_name}: {str(e)}")
+            raise
     
-    def get_variable_value(self, variable_table: str, variable_name: str) -> Optional[str]:
+    def disconnect(self) -> None:
         """
-        Get variable value from configuration table
-        
-        Args:
-            variable_table: Variable table name
-            variable_name: Variable name
-        
-        Returns:
-            Variable value or None
+        Close database connection and cleanup resources
         """
         try:
-            query = f"SELECT value FROM {variable_table} WHERE name=%s"
-            result = self.execute_query(query, (variable_name,))
-            if result:
-                return result[0]['value']
-            return None
+            if self.connection:
+                self.connection.close()
+                self.is_connected = False
+                
+                if self.logger:
+                    self.logger.info("✅ Database connection closed successfully")
+                    
         except Exception as e:
-            self.logger.log_exception(e, f"Get variable: {variable_name}")
-            return None
+            if self.logger:
+                self.logger.warning(f"⚠️ Error while closing database connection: {str(e)}")
+        finally:
+            self.connection = None
+            self.is_connected = False
     
-    def get_customers(self, customer_table: str) -> List[Dict]:
-        """
-        Get active customers
-        
-        Args:
-            customer_table: Customer table name
-        
-        Returns:
-            List of customer dictionaries
-        """
-        try:
-            query = f"SELECT customer_id, customer_name FROM {customer_table} WHERE status=1"
-            return self.execute_query(query)
-        except Exception as e:
-            self.logger.log_exception(e, "Get customers")
-            return []
+    def __enter__(self):
+        """Context manager entry"""
+        self.connect()
+        return self
     
-    def get_excluded_salts(self, salt_table: str) -> List[str]:
-        """
-        Get list of excluded salt names
-        
-        Args:
-            salt_table: Salt exclusion table name
-        
-        Returns:
-            List of salt names
-        """
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.disconnect()
+        return False  # Don't suppress exceptions
+    
+    def __del__(self):
+        """Destructor - ensure connection is closed"""
         try:
-            query = f"SELECT saltname FROM {salt_table} WHERE status=1"
-            results = self.execute_query(query)
-            return [row['saltname'] for row in results]
-        except Exception as e:
-            self.logger.log_exception(e, "Get excluded salts")
-            return []
+            self.disconnect()
+        except Exception:
+            pass
