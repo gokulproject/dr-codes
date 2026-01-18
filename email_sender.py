@@ -1,6 +1,7 @@
 """
-Email sender module for Drug Intelligence Automation
-Handles all email operations including sending with attachments
+Email Sender Module - Drug Intelligence Automation
+Handles all email notifications with attachments
+Supports success/failure notifications with templates
 """
 
 import smtplib
@@ -8,233 +9,361 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Dict, Any
 import os
-from logger import get_logger
 
 
 class EmailSender:
-    """Email sender class for sending notifications"""
+    """
+    Email sender class for sending notifications with attachments
+    """
     
-    def __init__(self, email_config: dict):
+    def __init__(self, config: Dict[str, Any], logger=None):
         """
-        Initialize email sender
+        Initialize email sender with SMTP configuration
         
         Args:
-            email_config: Email configuration dictionary
+            config: Email configuration dictionary containing:
+                - host: SMTP server host
+                - port: SMTP server port
+                - auth_user: SMTP authentication username
+                - auth_pass: SMTP authentication password
+                - from_address: Sender email address
+                - use_tls: Whether to use TLS (default: True)
+            logger: Logger instance for logging email operations
         """
-        self.config = email_config
-        self.logger = get_logger()
+        self.config = config
+        self.logger = logger
+        
+        # SMTP Configuration
+        self.smtp_host = config.get('host')
+        self.smtp_port = config.get('port', 587)
+        self.auth_user = config.get('auth_user')
+        self.auth_pass = config.get('auth_pass')
+        self.from_address = config.get('from_address')
+        self.use_tls = config.get('use_tls', True)
+        
+        if self.logger:
+            self.logger.debug(f"Email sender initialized with host: {self.smtp_host}:{self.smtp_port}")
     
     def send_email(
         self,
-        to_address: str,
+        to_addresses: str,
         subject: str,
         body: str,
-        cc_address: Optional[str] = None,
-        attachments: Optional[List[str]] = None
+        cc_addresses: Optional[str] = None,
+        attachments: Optional[List[str]] = None,
+        is_html: bool = False
     ) -> bool:
         """
         Send email with optional attachments
         
         Args:
-            to_address: Recipient email address (can be semicolon-separated)
+            to_addresses: Semicolon-separated recipient email addresses
             subject: Email subject
-            body: Email body (can contain HTML)
-            cc_address: CC email address (optional, semicolon-separated)
-            attachments: List of file paths to attach (optional)
-        
+            body: Email body content
+            cc_addresses: Semicolon-separated CC email addresses
+            attachments: List of file paths to attach
+            is_html: Whether body is HTML content
+            
         Returns:
-            bool: True if email sent successfully
+            bool: True if email sent successfully, False otherwise
         """
         try:
-            self.logger.log_function_start(
-                "send_email",
-                to=to_address,
-                subject=subject,
-                has_attachments=bool(attachments)
-            )
+            if self.logger:
+                self.logger.log_function_entry(
+                    "send_email",
+                    to=to_addresses,
+                    subject=subject,
+                    cc=cc_addresses,
+                    attachments_count=len(attachments) if attachments else 0
+                )
             
             # Create message
             msg = MIMEMultipart()
-            msg['From'] = self.config['from_address']
-            msg['To'] = to_address
+            msg['From'] = self.from_address
             msg['Subject'] = subject
             
-            if cc_address:
-                msg['Cc'] = cc_address
+            # Parse TO addresses
+            to_list = [addr.strip() for addr in to_addresses.split(';') if addr.strip()]
+            msg['To'] = ', '.join(to_list)
+            
+            # Parse CC addresses if provided
+            cc_list = []
+            if cc_addresses:
+                cc_list = [addr.strip() for addr in cc_addresses.split(';') if addr.strip()]
+                if cc_list:
+                    msg['Cc'] = ', '.join(cc_list)
+            
+            # Combine all recipients
+            all_recipients = to_list + cc_list
+            
+            if not all_recipients:
+                raise ValueError("No valid recipient email addresses provided")
             
             # Attach body
-            # Convert line breaks for HTML display
-            html_body = body.replace('\n', '<br>')
-            msg.attach(MIMEText(html_body, 'html'))
+            mime_type = 'html' if is_html else 'plain'
+            msg.attach(MIMEText(body, mime_type))
             
-            # Attach files
+            # Attach files if provided
             if attachments:
                 for file_path in attachments:
-                    if os.path.exists(file_path):
+                    try:
                         self._attach_file(msg, file_path)
-                    else:
-                        self.logger.warning(f"Attachment file not found: {file_path}")
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.warning(f"⚠️ Failed to attach file {file_path}: {str(e)}")
             
-            # Prepare recipient list
-            recipients = self._parse_addresses(to_address)
-            if cc_address:
-                recipients.extend(self._parse_addresses(cc_address))
+            # Connect to SMTP server and send
+            if self.logger:
+                self.logger.info(f"⏳ Connecting to SMTP server {self.smtp_host}:{self.smtp_port}...")
             
-            # Send email
-            with smtplib.SMTP(self.config['host'], self.config['port']) as server:
-                server.starttls()
-                server.login(
-                    self.config['auth_user'],
-                    self.config['auth_pass']
-                )
+            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
+                # Enable TLS if configured
+                if self.use_tls:
+                    server.starttls()
+                
+                # Login
+                if self.logger:
+                    self.logger.debug("Authenticating with SMTP server...")
+                
+                server.login(self.auth_user, self.auth_pass)
+                
+                # Send email
+                if self.logger:
+                    self.logger.info(f"⏳ Sending email to {len(all_recipients)} recipient(s)...")
+                
                 server.send_message(msg)
             
-            self.logger.log_email_sent(to_address, subject, "Success")
-            self.logger.log_function_end("send_email", "Success")
+            if self.logger:
+                self.logger.log_email_status(
+                    recipient=', '.join(to_list),
+                    subject=subject,
+                    status="SUCCESS"
+                )
+                self.logger.log_function_exit("send_email", result="SUCCESS")
+            
             return True
             
+        except smtplib.SMTPException as e:
+            error_msg = f"SMTP Error while sending email: {str(e)}"
+            if self.logger:
+                self.logger.error(f"❌ {error_msg}")
+                self.logger.log_exception("send_email", e)
+            return False
+            
         except Exception as e:
-            self.logger.log_exception(e, "Send email")
-            self.logger.log_email_sent(to_address, subject, f"Failed: {str(e)}")
+            error_msg = f"Failed to send email: {str(e)}"
+            if self.logger:
+                self.logger.error(f"❌ {error_msg}")
+                self.logger.log_exception("send_email", e)
             return False
     
-    def _attach_file(self, msg: MIMEMultipart, file_path: str):
+    def _attach_file(self, msg: MIMEMultipart, file_path: str) -> None:
         """
-        Attach file to email message
+        Attach a file to the email message
         
         Args:
-            msg: Email message object
+            msg: MIMEMultipart message object
             file_path: Path to file to attach
+            
+        Raises:
+            FileNotFoundError: If file doesn't exist
+            Exception: If file cannot be read or attached
         """
         try:
-            filename = os.path.basename(file_path)
+            file_path_obj = Path(file_path)
             
-            with open(file_path, 'rb') as attachment:
+            # Check if file exists
+            if not file_path_obj.exists():
+                raise FileNotFoundError(f"Attachment file not found: {file_path}")
+            
+            # Check if file is readable
+            if not os.access(file_path, os.R_OK):
+                raise PermissionError(f"Cannot read attachment file: {file_path}")
+            
+            # Read file and attach
+            with open(file_path, 'rb') as f:
                 part = MIMEBase('application', 'octet-stream')
-                part.set_payload(attachment.read())
+                part.set_payload(f.read())
             
+            # Encode file in base64
             encoders.encode_base64(part)
+            
+            # Add header with filename
+            filename = file_path_obj.name
             part.add_header(
                 'Content-Disposition',
                 f'attachment; filename= {filename}'
             )
             
+            # Attach to message
             msg.attach(part)
-            self.logger.debug(f"Attached file: {filename}")
             
+            if self.logger:
+                self.logger.debug(f"✅ File attached: {filename}")
+                
         except Exception as e:
-            self.logger.log_exception(e, f"Attach file: {file_path}")
+            if self.logger:
+                self.logger.error(f"❌ Failed to attach file {file_path}: {str(e)}")
+            raise
     
-    def _parse_addresses(self, addresses: str) -> List[str]:
-        """
-        Parse semicolon-separated email addresses
-        
-        Args:
-            addresses: Semicolon-separated email addresses
-        
-        Returns:
-            List of email addresses
-        """
-        if not addresses:
-            return []
-        return [addr.strip() for addr in addresses.split(';') if addr.strip()]
-    
-    def send_success_email(
+    def send_success_notification(
         self,
-        mail_config: dict,
+        mail_config: Dict[str, str],
+        process_id: str,
+        filename: str,
         success_files: List[tuple],
         failed_files: List[tuple],
-        attachments: List[str]
+        attachments: Optional[List[str]] = None
     ) -> bool:
         """
-        Send success notification email
+        Send success notification email with summary
         
         Args:
-            mail_config: Mail configuration dictionary
-            success_files: List of (customer_name, filename) tuples
-            failed_files: List of (customer_name, filename, error) tuples
+            mail_config: Dictionary containing email template configuration
+            process_id: Process ID
+            filename: Master tracker filename
+            success_files: List of tuples (customer_name, filename)
+            failed_files: List of tuples (customer_name, filename, error_message)
             attachments: List of file paths to attach
-        
+            
         Returns:
-            bool: True if sent successfully
+            bool: True if email sent successfully
         """
         try:
+            if self.logger:
+                self.logger.info("⏳ Preparing success notification email...")
+            
             # Format success files
             if success_files:
-                success_list = '\n'.join([
-                    f"{i+1}) {item[0]} - {item[1]}"
-                    for i, item in enumerate(success_files)
+                success_list = "\n".join([
+                    f"{i+1}) {customer} - {file}" 
+                    for i, (customer, file) in enumerate(success_files)
                 ])
             else:
                 success_list = "NA"
             
             # Format failed files
             if failed_files:
-                failed_list = '\n'.join([
-                    f"{i+1}) {item[0]} - {item[1]} - {item[2]}"
-                    for i, item in enumerate(failed_files)
+                failed_list = "\n".join([
+                    f"{i+1}) {customer} - {file} - {error}" 
+                    for i, (customer, file, error) in enumerate(failed_files)
                 ])
             else:
                 failed_list = "NA"
             
-            # Prepare email body
-            files_info = f"Success Files:\n{success_list}\n\nFailed Files:\n{failed_list}"
-            body = mail_config['success_mail_body'].replace('<FILES>', files_info)
-            body = body.replace('<>', '\n')
+            # Combine success and failed files
+            files_summary = f"Success Files:\n{success_list}\n\nFailed Files:\n{failed_list}"
+            
+            # Get email template from config
+            subject = mail_config.get('Success Mail Subject', 'Drug Intelligence - Process Completed')
+            body_template = mail_config.get('Success Mail Body', 'Process completed. <FILES>')
+            
+            # Replace placeholders
+            body = body_template.replace('<FILES>', files_summary)
+            body = body.replace('<>', '\n')  # Replace custom line break markers
+            
+            # Get recipients
+            to_addresses = mail_config.get('Success To Address', '')
+            cc_addresses = mail_config.get('Success Cc Address', '')
             
             # Send email
             return self.send_email(
-                to_address=mail_config['success_to_address'],
-                subject=mail_config['success_mail_subject'],
+                to_addresses=to_addresses,
+                subject=subject,
                 body=body,
-                cc_address=mail_config.get('success_cc_address'),
-                attachments=attachments
+                cc_addresses=cc_addresses,
+                attachments=attachments,
+                is_html=False
             )
             
         except Exception as e:
-            self.logger.log_exception(e, "Send success email")
+            if self.logger:
+                self.logger.error(f"❌ Failed to send success notification: {str(e)}")
             return False
     
-    def send_failure_email(
+    def send_failure_notification(
         self,
-        mail_config: dict,
+        mail_config: Dict[str, str],
         process_id: str,
         filename: str,
         error_message: str,
-        attachment: Optional[str] = None
+        attachment_path: Optional[str] = None
     ) -> bool:
         """
         Send failure notification email
         
         Args:
-            mail_config: Mail configuration dictionary
+            mail_config: Dictionary containing email template configuration
             process_id: Process ID
             filename: Master tracker filename
-            error_message: Error message
-            attachment: Optional attachment file path
-        
+            error_message: Error message describing the failure
+            attachment_path: Optional path to failed file
+            
         Returns:
-            bool: True if sent successfully
+            bool: True if email sent successfully
         """
         try:
-            # Prepare email body
-            process_info = f"{process_id} - {filename} - {error_message}"
-            body = mail_config['failure_mail_body'].replace('<process_id>', process_info)
-            body = body.replace('<>', '\n')
+            if self.logger:
+                self.logger.info("⏳ Preparing failure notification email...")
+            
+            # Get email template from config
+            subject = mail_config.get('Failure Mail Subject', 'Drug Intelligence - Process Failed')
+            body_template = mail_config.get('Failure Mail Body', 'Process failed. <process_id>')
+            
+            # Format error details
+            error_details = f"{process_id} - {filename} - {error_message}"
+            
+            # Replace placeholders
+            body = body_template.replace('<process_id>', error_details)
+            body = body.replace('<>', '\n')  # Replace custom line break markers
+            
+            # Get recipients
+            to_addresses = mail_config.get('Failure To Address', '')
+            cc_addresses = mail_config.get('Failure Cc Address', '')
+            
+            # Prepare attachments
+            attachments = [attachment_path] if attachment_path and os.path.exists(attachment_path) else None
             
             # Send email
-            attachments = [attachment] if attachment else None
-            
             return self.send_email(
-                to_address=mail_config['failure_to_address'],
-                subject=mail_config['failure_mail_subject'],
+                to_addresses=to_addresses,
+                subject=subject,
                 body=body,
-                cc_address=mail_config.get('failure_cc_address'),
-                attachments=attachments
+                cc_addresses=cc_addresses,
+                attachments=attachments,
+                is_html=False
             )
             
         except Exception as e:
-            self.logger.log_exception(e, "Send failure email")
+            if self.logger:
+                self.logger.error(f"❌ Failed to send failure notification: {str(e)}")
+            return False
+    
+    def test_connection(self) -> bool:
+        """
+        Test SMTP connection
+        
+        Returns:
+            bool: True if connection successful
+        """
+        try:
+            if self.logger:
+                self.logger.info(f"⏳ Testing SMTP connection to {self.smtp_host}:{self.smtp_port}...")
+            
+            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10) as server:
+                if self.use_tls:
+                    server.starttls()
+                server.login(self.auth_user, self.auth_pass)
+            
+            if self.logger:
+                self.logger.success("✅ SMTP connection test successful")
+            
+            return True
+            
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"❌ SMTP connection test failed: {str(e)}")
             return False
