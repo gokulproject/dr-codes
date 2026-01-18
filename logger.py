@@ -1,160 +1,339 @@
 """
-Logger module for Drug Intelligence Automation
-Handles all logging operations with process-specific log files
+Logger Module - Drug Intelligence Automation
+Comprehensive logging with dual output: File + Console
+Includes colored console output with status indicators
 """
 
 import logging
 import os
+import sys
 from datetime import datetime
 from typing import Optional
+from pathlib import Path
+
+
+class ColoredFormatter(logging.Formatter):
+    """
+    Custom formatter with color codes for console output
+    """
+    
+    # ANSI color codes
+    COLORS = {
+        'DEBUG': '\033[36m',      # Cyan
+        'INFO': '\033[37m',       # White
+        'WARNING': '\033[33m',    # Yellow
+        'ERROR': '\033[31m',      # Red
+        'CRITICAL': '\033[35m',   # Magenta
+        'SUCCESS': '\033[32m',    # Green
+        'RESET': '\033[0m'        # Reset
+    }
+    
+    # Status icons
+    ICONS = {
+        'DEBUG': 'ℹ️',
+        'INFO': 'ℹ️',
+        'WARNING': '⚠️',
+        'ERROR': '❌',
+        'CRITICAL': '🔥',
+        'SUCCESS': '✅',
+        'PENDING': '⏳'
+    }
+    
+    def format(self, record):
+        """
+        Format log record with colors and icons for console
+        """
+        # Add color based on level
+        if hasattr(record, 'levelname'):
+            color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
+            reset = self.COLORS['RESET']
+            
+            # Add icon if available
+            icon = self.ICONS.get(record.levelname, '')
+            
+            # Create colored message
+            record.levelname_colored = f"{color}{icon} {record.levelname}{reset}"
+            record.msg_colored = f"{color}{record.msg}{reset}"
+        
+        return super().format(record)
 
 
 class DrugIntelligenceLogger:
-    """Custom logger for Drug Intelligence project"""
+    """
+    Custom logger for Drug Intelligence Automation
+    Provides dual logging: File (detailed) + Console (formatted with colors)
+    """
     
-    def __init__(self, process_id: Optional[str] = None, log_dir: str = "logs"):
+    def __init__(self, process_id: Optional[str] = None, log_dir: str = "./logs"):
         """
-        Initialize logger
+        Initialize logger with file and console handlers
         
         Args:
-            process_id: Unique process identifier
+            process_id: Unique process identifier for log file naming
             log_dir: Directory to store log files
         """
-        self.process_id = process_id or "INIT"
-        self.log_dir = log_dir
-        self.logger = self._setup_logger()
-    
-    def _setup_logger(self) -> logging.Logger:
-        """Setup and configure logger"""
-        # Create logs directory if not exists
-        os.makedirs(self.log_dir, exist_ok=True)
+        self.process_id = process_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_dir = Path(log_dir)
+        
+        # Create log directory if not exists
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"Warning: Could not create log directory: {e}")
+            self.log_dir = Path(".")
+        
+        # Generate log filename: ProcessID_DateTime.log
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_filename = f"Process_{self.process_id}_{timestamp}.log"
+        self.log_filepath = self.log_dir / self.log_filename
         
         # Create logger
-        logger = logging.getLogger(f"DrugIntelligence_{self.process_id}")
-        logger.setLevel(logging.DEBUG)
+        self.logger = logging.getLogger(f"DrugIntelligence_{self.process_id}")
+        self.logger.setLevel(logging.DEBUG)
         
-        # Clear existing handlers
-        logger.handlers.clear()
+        # Remove existing handlers if any
+        self.logger.handlers.clear()
         
-        # Create file handler
-        log_filename = self._generate_log_filename()
-        file_handler = logging.FileHandler(log_filename, encoding='utf-8')
-        file_handler.setLevel(logging.DEBUG)
+        # Add custom SUCCESS level
+        self._add_success_level()
         
-        # Create console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
+        # Setup file handler
+        self._setup_file_handler()
         
-        # Create formatter
-        formatter = logging.Formatter(
-            '%(asctime)s - [%(levelname)s] - Process: %(process_name)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
+        # Setup console handler
+        self._setup_console_handler()
         
-        file_handler.setFormatter(formatter)
-        console_handler.setFormatter(formatter)
+        # Log initialization
+        self.logger.info("=" * 80)
+        self.logger.info(f"Drug Intelligence Automation - Process ID: {self.process_id}")
+        self.logger.info(f"Log File: {self.log_filepath}")
+        self.logger.info(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.logger.info("=" * 80)
+    
+    def _add_success_level(self):
+        """
+        Add custom SUCCESS logging level (between INFO and WARNING)
+        """
+        SUCCESS_LEVEL = 25
+        logging.addLevelName(SUCCESS_LEVEL, "SUCCESS")
         
-        # Add handlers to logger
-        logger.addHandler(file_handler)
-        logger.addHandler(console_handler)
+        def success(self, message, *args, **kwargs):
+            if self.isEnabledFor(SUCCESS_LEVEL):
+                self._log(SUCCESS_LEVEL, message, args, **kwargs)
         
-        # Prevent propagation to root logger
-        logger.propagate = False
+        logging.Logger.success = success
+    
+    def _setup_file_handler(self):
+        """
+        Setup file handler for detailed logging
+        """
+        try:
+            # File handler - detailed format
+            file_handler = logging.FileHandler(
+                self.log_filepath,
+                mode='a',
+                encoding='utf-8'
+            )
+            file_handler.setLevel(logging.DEBUG)
+            
+            # File format: timestamp | level | function | message
+            file_format = logging.Formatter(
+                fmt='%(asctime)s | %(levelname)-8s | %(funcName)-25s | %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            file_handler.setFormatter(file_format)
+            
+            self.logger.addHandler(file_handler)
+            
+        except Exception as e:
+            print(f"Error setting up file handler: {e}")
+    
+    def _setup_console_handler(self):
+        """
+        Setup console handler for colored real-time output
+        """
+        try:
+            # Console handler - simple colored format
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(logging.INFO)
+            
+            # Console format: icon + level + message
+            console_format = ColoredFormatter(
+                fmt='%(levelname_colored)-20s | %(msg_colored)s'
+            )
+            console_handler.setFormatter(console_format)
+            
+            self.logger.addHandler(console_handler)
+            
+        except Exception as e:
+            print(f"Error setting up console handler: {e}")
+    
+    def debug(self, message: str):
+        """Log DEBUG level message"""
+        self.logger.debug(message)
+    
+    def info(self, message: str):
+        """Log INFO level message"""
+        self.logger.info(message)
+    
+    def warning(self, message: str):
+        """Log WARNING level message"""
+        self.logger.warning(message)
+    
+    def error(self, message: str):
+        """Log ERROR level message"""
+        self.logger.error(message)
+    
+    def critical(self, message: str):
+        """Log CRITICAL level message"""
+        self.logger.critical(message)
+    
+    def success(self, message: str):
+        """Log SUCCESS level message"""
+        self.logger.success(message)
+    
+    def pending(self, message: str):
+        """Log PENDING status (INFO level with pending icon)"""
+        # Temporarily modify the message for pending status
+        self.logger.info(f"⏳ {message}")
+    
+    def log_function_entry(self, func_name: str, **kwargs):
+        """
+        Log function entry with parameters
         
-        return logger
+        Args:
+            func_name: Name of the function
+            **kwargs: Function parameters to log
+        """
+        params = ", ".join([f"{k}={v}" for k, v in kwargs.items()]) if kwargs else "No parameters"
+        self.debug(f">>> ENTERING: {func_name}({params})")
     
-    def _generate_log_filename(self) -> str:
-        """Generate log filename with timestamp and process ID"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"DrugIntelligence_{self.process_id}_{timestamp}.log"
-        return os.path.join(self.log_dir, filename)
+    def log_function_exit(self, func_name: str, result: any = None):
+        """
+        Log function exit with result
+        
+        Args:
+            func_name: Name of the function
+            result: Return value or result status
+        """
+        result_str = f"Result: {result}" if result is not None else "Completed"
+        self.debug(f"<<< EXITING: {func_name} - {result_str}")
     
-    def _log_with_context(self, level: str, message: str, **kwargs):
-        """Log message with additional context"""
-        extra = {'process_name': self.process_id}
-        log_method = getattr(self.logger, level.lower())
-        log_method(message, extra=extra, **kwargs)
+    def log_exception(self, func_name: str, exception: Exception):
+        """
+        Log exception with details
+        
+        Args:
+            func_name: Name of the function where exception occurred
+            exception: Exception object
+        """
+        import traceback
+        self.error(f"Exception in {func_name}: {type(exception).__name__}: {str(exception)}")
+        self.debug(f"Traceback:\n{traceback.format_exc()}")
     
-    def debug(self, message: str, **kwargs):
-        """Log debug message"""
-        self._log_with_context('DEBUG', message, **kwargs)
+    def log_database_query(self, query: str, params: Optional[tuple] = None):
+        """
+        Log database query execution
+        
+        Args:
+            query: SQL query string
+            params: Query parameters if any
+        """
+        if params:
+            self.debug(f"DB Query: {query} | Params: {params}")
+        else:
+            self.debug(f"DB Query: {query}")
     
-    def info(self, message: str, **kwargs):
-        """Log info message"""
-        self._log_with_context('INFO', message, **kwargs)
+    def log_file_operation(self, operation: str, filepath: str, status: str = "SUCCESS"):
+        """
+        Log file operations
+        
+        Args:
+            operation: Type of operation (READ, WRITE, DELETE, MOVE)
+            filepath: File path
+            status: Operation status
+        """
+        icon = "✅" if status == "SUCCESS" else "❌"
+        self.info(f"{icon} File {operation}: {filepath}")
     
-    def warning(self, message: str, **kwargs):
-        """Log warning message"""
-        self._log_with_context('WARNING', message, **kwargs)
+    def log_email_status(self, recipient: str, subject: str, status: str):
+        """
+        Log email sending status
+        
+        Args:
+            recipient: Email recipient
+            subject: Email subject
+            status: Send status
+        """
+        icon = "✅" if status == "SUCCESS" else "❌"
+        self.info(f"{icon} Email {status}: To={recipient} | Subject={subject}")
     
-    def error(self, message: str, exc_info: bool = False, **kwargs):
-        """Log error message"""
-        self._log_with_context('ERROR', message, exc_info=exc_info, **kwargs)
+    def log_process_step(self, step_name: str, status: str = "STARTED"):
+        """
+        Log major process steps
+        
+        Args:
+            step_name: Name of the process step
+            status: STARTED, COMPLETED, FAILED
+        """
+        separator = "-" * 60
+        
+        if status == "STARTED":
+            self.info(separator)
+            self.pending(f"STEP: {step_name}")
+            self.info(separator)
+        elif status == "COMPLETED":
+            self.success(f"STEP COMPLETED: {step_name}")
+            self.info(separator)
+        elif status == "FAILED":
+            self.error(f"STEP FAILED: {step_name}")
+            self.info(separator)
     
-    def critical(self, message: str, exc_info: bool = False, **kwargs):
-        """Log critical message"""
-        self._log_with_context('CRITICAL', message, exc_info=exc_info, **kwargs)
+    def log_summary(self, summary_data: dict):
+        """
+        Log summary report at end of execution
+        
+        Args:
+            summary_data: Dictionary with summary information
+        """
+        self.info("=" * 80)
+        self.info("EXECUTION SUMMARY")
+        self.info("=" * 80)
+        
+        for key, value in summary_data.items():
+            self.info(f"{key}: {value}")
+        
+        self.info("=" * 80)
     
-    def log_function_start(self, function_name: str, **params):
-        """Log function start with parameters"""
-        param_str = ', '.join([f"{k}={v}" for k, v in params.items()])
-        self.info(f"Starting function: {function_name}({param_str})")
-    
-    def log_function_end(self, function_name: str, result: str = "Success"):
-        """Log function end"""
-        self.info(f"Completed function: {function_name} - Result: {result}")
-    
-    def log_database_operation(self, operation: str, table: str, details: str = ""):
-        """Log database operations"""
-        self.debug(f"DB Operation: {operation} on table '{table}' - {details}")
-    
-    def log_file_operation(self, operation: str, filepath: str, status: str = "Success"):
-        """Log file operations"""
-        self.info(f"File Operation: {operation} - {filepath} - Status: {status}")
-    
-    def log_email_sent(self, recipients: str, subject: str, status: str = "Success"):
-        """Log email sending"""
-        self.info(f"Email Sent - To: {recipients} - Subject: {subject} - Status: {status}")
-    
-    def log_process_status(self, status: str, details: str = ""):
-        """Log process status updates"""
-        self.info(f"Process Status Updated: {status} - {details}")
-    
-    def log_customer_processing(self, customer_name: str, customer_id: str, status: str):
-        """Log customer processing status"""
-        self.info(f"Customer Processing - Name: {customer_name}, ID: {customer_id} - Status: {status}")
-    
-    def log_exception(self, exception: Exception, context: str = ""):
-        """Log exception with full traceback"""
-        error_msg = f"Exception occurred{' in ' + context if context else ''}: {str(exception)}"
-        self.error(error_msg, exc_info=True)
-    
-    def update_process_id(self, new_process_id: str):
-        """Update process ID for logger"""
-        self.process_id = new_process_id
-        # Recreate logger with new process ID
-        self.logger = self._setup_logger()
+    def close(self):
+        """
+        Close all handlers and cleanup
+        """
+        try:
+            self.info("=" * 80)
+            self.info(f"Logging ended at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            self.info(f"Log file saved: {self.log_filepath}")
+            self.info("=" * 80)
+            
+            # Close all handlers
+            for handler in self.logger.handlers[:]:
+                handler.close()
+                self.logger.removeHandler(handler)
+                
+        except Exception as e:
+            print(f"Error closing logger: {e}")
 
 
-# Singleton instance for global access
-_logger_instance: Optional[DrugIntelligenceLogger] = None
-
-
-def get_logger(process_id: Optional[str] = None) -> DrugIntelligenceLogger:
+# Convenience function to create logger
+def create_logger(process_id: Optional[str] = None, log_dir: str = "./logs") -> DrugIntelligenceLogger:
     """
-    Get logger instance (singleton pattern)
+    Create and return a DrugIntelligenceLogger instance
     
     Args:
-        process_id: Process identifier
-    
+        process_id: Unique process identifier
+        log_dir: Directory to store log files
+        
     Returns:
         DrugIntelligenceLogger instance
     """
-    global _logger_instance
-    
-    if _logger_instance is None:
-        _logger_instance = DrugIntelligenceLogger(process_id)
-    elif process_id and _logger_instance.process_id != process_id:
-        _logger_instance.update_process_id(process_id)
-    
-    return _logger_instance
+    return DrugIntelligenceLogger(process_id=process_id, log_dir=log_dir)
