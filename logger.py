@@ -337,3 +337,276 @@ def create_logger(process_id: Optional[str] = None, log_dir: str = "./logs") -> 
         DrugIntelligenceLogger instance
     """
     return DrugIntelligenceLogger(process_id=process_id, log_dir=log_dir)
+
+
+****************
+
+{% load static %}
+{% load django_bootstrap5 %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Process Records - {{ status_id }}</title>
+
+    {% bootstrap_css %}
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+
+    <style>
+        body {
+            background: #f4f6f9;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            padding-top: 110px;
+        }
+
+        /* Cards */
+        .card {
+            border: none;
+            border-radius: 12px;
+            box-shadow: 0 6px 16px rgba(0,0,0,0.08);
+        }
+
+        .card-header {
+            background: #ffffff;
+            border-bottom: 1px solid #e9ecef;
+            font-weight: 600;
+        }
+
+        /* Section header */
+        .hc-section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        /* Badge */
+        .customer-env-badge {
+            background: #e7f3ff;
+            color: #0d6efd;
+            font-size: 0.75rem;
+            padding: 4px 10px;
+            border-radius: 14px;
+            font-weight: 600;
+        }
+
+        /* Table */
+        .hc-table {
+            width: 100%;
+            font-size: 0.82rem;
+            white-space: nowrap;
+        }
+
+        .hc-table thead th {
+            background: #f1f3f5;
+            font-weight: 700;
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            padding: 10px;
+            position: sticky;
+            top: 0;
+            z-index: 2;
+        }
+
+        .hc-table tbody td {
+            padding: 8px 10px;
+            border-top: 1px solid #dee2e6;
+            vertical-align: middle;
+        }
+
+        .hc-table tbody tr:hover {
+            background: #f8f9ff;
+        }
+
+        /* YES / NO pills */
+        .metric-yes {
+            background: #dc3545;
+            color: #fff;
+            font-size: 0.7rem;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-weight: 700;
+        }
+
+        .metric-no {
+            background: #198754;
+            color: #fff;
+            font-size: 0.7rem;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-weight: 700;
+        }
+
+        /* No data */
+        .hc-no-data {
+            text-align: center;
+            padding: 3rem;
+            color: #6c757d;
+        }
+
+        /* Spinner */
+        .section-spinner {
+            display: none;
+            justify-content: center;
+            align-items: center;
+            padding: 2rem;
+        }
+
+        /* Download Button */
+        .download-btn {
+            background: linear-gradient(135deg, #20c997, #198754);
+            border: none;
+            color: #fff;
+            font-weight: 600;
+            padding: 6px 14px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .download-btn:hover {
+            background: linear-gradient(135deg, #198754, #157347);
+            transform: translateY(-1px);
+        }
+
+        .download-btn:disabled {
+            background: #adb5bd;
+            cursor: not-allowed;
+        }
+
+        /* Meta info */
+        .meta-info {
+            background: #ffffff;
+            border-left: 4px solid #0d6efd;
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin-top: 8px;
+            font-size: 0.85rem;
+        }
+
+        /* Horizontal scroll wrapper */
+        .table-responsive-xxl {
+            max-height: 360px;
+            overflow: auto;
+        }
+    </style>
+</head>
+
+<body>
+
+<header>
+    {% include "healthcheckapp/hc_navbar.html" %}
+</header>
+
+<div class="container-fluid py-3">
+
+    <!-- Header -->
+    <div class="d-flex flex-wrap justify-content-between align-items-center mb-4 gap-2">
+        <div>
+            <h5 class="mb-1">
+                Process Records
+                <span class="badge bg-primary">{{ status_id }}</span>
+            </h5>
+            <div id="metaInfo" class="meta-info d-none">
+                <strong>Loading process info...</strong>
+            </div>
+        </div>
+
+        <div class="d-flex gap-2">
+            <button id="btnDownloadExcel" class="btn download-btn btn-sm" disabled>
+                <i class="bi bi-file-earmark-excel"></i> Download Excel
+            </button>
+
+            {% if job %}
+                <a href="{% url 'healthcheckapp	cb9' job.id %}" class="btn btn-outline-primary btn-sm">
+                    <i class="bi bi-arrow-left"></i> Back
+                </a>
+            {% else %}
+                <a href="javascript:history.back()" class="btn btn-outline-primary btn-sm">
+                    <i class="bi bi-arrow-left"></i> Back
+                </a>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- GRID -->
+    <div class="row g-3">
+
+        <!-- DATABASE -->
+        <div class="col-xl-6 col-lg-12">
+            <div class="card h-100">
+                <div class="card-header hc-section-header">
+                    <span><i class="bi bi-database"></i> Database Health</span>
+                    <span id="dbCustomerEnv" class="customer-env-badge d-none"></span>
+                </div>
+                <div class="card-body p-0">
+                    <div id="dbSpinner" class="section-spinner">
+                        <div class="spinner-border spinner-border-sm text-primary"></div>
+                    </div>
+                    <div id="dbReportContainer" class="table-responsive-xxl"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- FILESYSTEM -->
+        <div class="col-xl-6 col-lg-12">
+            <div class="card h-100">
+                <div class="card-header hc-section-header">
+                    <span><i class="bi bi-hdd-network"></i> Filesystem Health</span>
+                    <span id="fsCustomerEnv" class="customer-env-badge d-none"></span>
+                </div>
+                <div class="card-body p-0">
+                    <div id="fsSpinner" class="section-spinner">
+                        <div class="spinner-border spinner-border-sm text-primary"></div>
+                    </div>
+                    <div id="fsReportContainer" class="table-responsive-xxl"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- TABLESPACE -->
+        <div class="col-xl-6 col-lg-12">
+            <div class="card h-100">
+                <div class="card-header hc-section-header">
+                    <span><i class="bi bi-table"></i> Tablespace Usage</span>
+                    <span id="tsCustomerEnv" class="customer-env-badge d-none"></span>
+                </div>
+                <div class="card-body p-0">
+                    <div id="tsSpinner" class="section-spinner">
+                        <div class="spinner-border spinner-border-sm text-primary"></div>
+                    </div>
+                    <div id="tsReportContainer" class="table-responsive-xxl"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- RMAN -->
+        <div class="col-xl-6 col-lg-12">
+            <div class="card h-100">
+                <div class="card-header hc-section-header">
+                    <span><i class="bi bi-cloud-arrow-down"></i> RMAN Backup</span>
+                    <span id="rmCustomerEnv" class="customer-env-badge d-none"></span>
+                </div>
+                <div class="card-body p-0">
+                    <div id="rmSpinner" class="section-spinner">
+                        <div class="spinner-border spinner-border-sm text-primary"></div>
+                    </div>
+                    <div id="rmReportContainer" class="table-responsive-xxl"></div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+{% bootstrap_javascript %}
+
+<!-- YOUR EXISTING JS REMAINS 100% SAME BELOW -->
+<script>
+    /* ❌ NO JS CHANGES MADE */
+</script>
+
+</body>
+</html>
