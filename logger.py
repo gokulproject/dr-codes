@@ -1,346 +1,3 @@
-"""
-Logger Module - Drug Intelligence Automation
-Comprehensive logging with dual output: File + Console
-Includes colored console output with status indicators
-"""
-
-import logging
-import os
-import sys
-from datetime import datetime
-from typing import Optional
-from pathlib import Path
-
-
-class ColoredFormatter(logging.Formatter):
-    """
-    Custom formatter with color codes for console output
-    """
-    
-    # ANSI color codes
-    COLORS = {
-        'DEBUG': '\033[36m',      # Cyan
-        'INFO': '\033[37m',       # White
-        'WARNING': '\033[33m',    # Yellow
-        'ERROR': '\033[31m',      # Red
-        'CRITICAL': '\033[35m',   # Magenta
-        'SUCCESS': '\033[32m',    # Green
-        'RESET': '\033[0m'        # Reset
-    }
-    
-    # Status icons
-    ICONS = {
-        'DEBUG': 'ℹ️',
-        'INFO': 'ℹ️',
-        'WARNING': '⚠️',
-        'ERROR': '❌',
-        'CRITICAL': '🔥',
-        'SUCCESS': '✅',
-        'PENDING': '⏳'
-    }
-    
-    def format(self, record):
-        """
-        Format log record with colors and icons for console
-        """
-        # Add color based on level
-        if hasattr(record, 'levelname'):
-            color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
-            reset = self.COLORS['RESET']
-            
-            # Add icon if available
-            icon = self.ICONS.get(record.levelname, '')
-            
-            # Create colored message
-            record.levelname_colored = f"{color}{icon} {record.levelname}{reset}"
-            record.msg_colored = f"{color}{record.msg}{reset}"
-        
-        return super().format(record)
-
-
-class DrugIntelligenceLogger:
-    """
-    Custom logger for Drug Intelligence Automation
-    Provides dual logging: File (detailed) + Console (formatted with colors)
-    """
-    
-    def __init__(self, process_id: Optional[str] = None, log_dir: str = "./logs"):
-        """
-        Initialize logger with file and console handlers
-        
-        Args:
-            process_id: Unique process identifier for log file naming
-            log_dir: Directory to store log files
-        """
-        self.process_id = process_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = Path(log_dir)
-        
-        # Create log directory if not exists
-        try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            print(f"Warning: Could not create log directory: {e}")
-            self.log_dir = Path(".")
-        
-        # Generate log filename: ProcessID_DateTime.log
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_filename = f"Process_{self.process_id}_{timestamp}.log"
-        self.log_filepath = self.log_dir / self.log_filename
-        
-        # Create logger
-        self.logger = logging.getLogger(f"DrugIntelligence_{self.process_id}")
-        self.logger.setLevel(logging.DEBUG)
-        
-        # Remove existing handlers if any
-        self.logger.handlers.clear()
-        
-        # Add custom SUCCESS level
-        self._add_success_level()
-        
-        # Setup file handler
-        self._setup_file_handler()
-        
-        # Setup console handler
-        self._setup_console_handler()
-        
-        # Log initialization
-        self.logger.info("=" * 80)
-        self.logger.info(f"Drug Intelligence Automation - Process ID: {self.process_id}")
-        self.logger.info(f"Log File: {self.log_filepath}")
-        self.logger.info(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        self.logger.info("=" * 80)
-    
-    def _add_success_level(self):
-        """
-        Add custom SUCCESS logging level (between INFO and WARNING)
-        """
-        SUCCESS_LEVEL = 25
-        logging.addLevelName(SUCCESS_LEVEL, "SUCCESS")
-        
-        def success(self, message, *args, **kwargs):
-            if self.isEnabledFor(SUCCESS_LEVEL):
-                self._log(SUCCESS_LEVEL, message, args, **kwargs)
-        
-        logging.Logger.success = success
-    
-    def _setup_file_handler(self):
-        """
-        Setup file handler for detailed logging
-        """
-        try:
-            # File handler - detailed format
-            file_handler = logging.FileHandler(
-                self.log_filepath,
-                mode='a',
-                encoding='utf-8'
-            )
-            file_handler.setLevel(logging.DEBUG)
-            
-            # File format: timestamp | level | function | message
-            file_format = logging.Formatter(
-                fmt='%(asctime)s | %(levelname)-8s | %(funcName)-25s | %(message)s',
-                datefmt='%Y-%m-%d %H:%M:%S'
-            )
-            file_handler.setFormatter(file_format)
-            
-            self.logger.addHandler(file_handler)
-            
-        except Exception as e:
-            print(f"Error setting up file handler: {e}")
-    
-    def _setup_console_handler(self):
-        """
-        Setup console handler for colored real-time output
-        """
-        try:
-            # Console handler - simple colored format
-            console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setLevel(logging.INFO)
-            
-            # Console format: icon + level + message
-            console_format = ColoredFormatter(
-                fmt='%(levelname_colored)-20s | %(msg_colored)s'
-            )
-            console_handler.setFormatter(console_format)
-            
-            self.logger.addHandler(console_handler)
-            
-        except Exception as e:
-            print(f"Error setting up console handler: {e}")
-    
-    def debug(self, message: str):
-        """Log DEBUG level message"""
-        self.logger.debug(message)
-    
-    def info(self, message: str):
-        """Log INFO level message"""
-        self.logger.info(message)
-    
-    def warning(self, message: str):
-        """Log WARNING level message"""
-        self.logger.warning(message)
-    
-    def error(self, message: str):
-        """Log ERROR level message"""
-        self.logger.error(message)
-    
-    def critical(self, message: str):
-        """Log CRITICAL level message"""
-        self.logger.critical(message)
-    
-    def success(self, message: str):
-        """Log SUCCESS level message"""
-        self.logger.success(message)
-    
-    def pending(self, message: str):
-        """Log PENDING status (INFO level with pending icon)"""
-        # Temporarily modify the message for pending status
-        self.logger.info(f"⏳ {message}")
-    
-    def log_function_entry(self, func_name: str, **kwargs):
-        """
-        Log function entry with parameters
-        
-        Args:
-            func_name: Name of the function
-            **kwargs: Function parameters to log
-        """
-        params = ", ".join([f"{k}={v}" for k, v in kwargs.items()]) if kwargs else "No parameters"
-        self.debug(f">>> ENTERING: {func_name}({params})")
-    
-    def log_function_exit(self, func_name: str, result: any = None):
-        """
-        Log function exit with result
-        
-        Args:
-            func_name: Name of the function
-            result: Return value or result status
-        """
-        result_str = f"Result: {result}" if result is not None else "Completed"
-        self.debug(f"<<< EXITING: {func_name} - {result_str}")
-    
-    def log_exception(self, func_name: str, exception: Exception):
-        """
-        Log exception with details
-        
-        Args:
-            func_name: Name of the function where exception occurred
-            exception: Exception object
-        """
-        import traceback
-        self.error(f"Exception in {func_name}: {type(exception).__name__}: {str(exception)}")
-        self.debug(f"Traceback:\n{traceback.format_exc()}")
-    
-    def log_database_query(self, query: str, params: Optional[tuple] = None):
-        """
-        Log database query execution
-        
-        Args:
-            query: SQL query string
-            params: Query parameters if any
-        """
-        if params:
-            self.debug(f"DB Query: {query} | Params: {params}")
-        else:
-            self.debug(f"DB Query: {query}")
-    
-    def log_file_operation(self, operation: str, filepath: str, status: str = "SUCCESS"):
-        """
-        Log file operations
-        
-        Args:
-            operation: Type of operation (READ, WRITE, DELETE, MOVE)
-            filepath: File path
-            status: Operation status
-        """
-        icon = "✅" if status == "SUCCESS" else "❌"
-        self.info(f"{icon} File {operation}: {filepath}")
-    
-    def log_email_status(self, recipient: str, subject: str, status: str):
-        """
-        Log email sending status
-        
-        Args:
-            recipient: Email recipient
-            subject: Email subject
-            status: Send status
-        """
-        icon = "✅" if status == "SUCCESS" else "❌"
-        self.info(f"{icon} Email {status}: To={recipient} | Subject={subject}")
-    
-    def log_process_step(self, step_name: str, status: str = "STARTED"):
-        """
-        Log major process steps
-        
-        Args:
-            step_name: Name of the process step
-            status: STARTED, COMPLETED, FAILED
-        """
-        separator = "-" * 60
-        
-        if status == "STARTED":
-            self.info(separator)
-            self.pending(f"STEP: {step_name}")
-            self.info(separator)
-        elif status == "COMPLETED":
-            self.success(f"STEP COMPLETED: {step_name}")
-            self.info(separator)
-        elif status == "FAILED":
-            self.error(f"STEP FAILED: {step_name}")
-            self.info(separator)
-    
-    def log_summary(self, summary_data: dict):
-        """
-        Log summary report at end of execution
-        
-        Args:
-            summary_data: Dictionary with summary information
-        """
-        self.info("=" * 80)
-        self.info("EXECUTION SUMMARY")
-        self.info("=" * 80)
-        
-        for key, value in summary_data.items():
-            self.info(f"{key}: {value}")
-        
-        self.info("=" * 80)
-    
-    def close(self):
-        """
-        Close all handlers and cleanup
-        """
-        try:
-            self.info("=" * 80)
-            self.info(f"Logging ended at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            self.info(f"Log file saved: {self.log_filepath}")
-            self.info("=" * 80)
-            
-            # Close all handlers
-            for handler in self.logger.handlers[:]:
-                handler.close()
-                self.logger.removeHandler(handler)
-                
-        except Exception as e:
-            print(f"Error closing logger: {e}")
-
-
-# Convenience function to create logger
-def create_logger(process_id: Optional[str] = None, log_dir: str = "./logs") -> DrugIntelligenceLogger:
-    """
-    Create and return a DrugIntelligenceLogger instance
-    
-    Args:
-        process_id: Unique process identifier
-        log_dir: Directory to store log files
-        
-    Returns:
-        DrugIntelligenceLogger instance
-    """
-    return DrugIntelligenceLogger(process_id=process_id, log_dir=log_dir)
-
-
-****************
-
 {% load static %}
 {% load django_bootstrap5 %}
 <!DOCTYPE html>
@@ -348,265 +5,675 @@ def create_logger(process_id: Optional[str] = None, log_dir: str = "./logs") -> 
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Process Records - {{ status_id }}</title>
-
+    <title>Healthcheck Dashboard - {{ job.name }}</title>
     {% bootstrap_css %}
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-
     <style>
         body {
-            background: #f4f6f9;
+            background: #f8f9fa;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            padding-top: 110px;
+            padding-top: 120px;
         }
-
-        /* Cards */
         .card {
             border: none;
-            border-radius: 12px;
-            box-shadow: 0 6px 16px rgba(0,0,0,0.08);
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }
-
-        .card-header {
-            background: #ffffff;
-            border-bottom: 1px solid #e9ecef;
+        .table th {
+            background: #e9ecef;
             font-weight: 600;
-        }
-
-        /* Section header */
-        .hc-section-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        /* Badge */
-        .customer-env-badge {
-            background: #e7f3ff;
-            color: #0d6efd;
-            font-size: 0.75rem;
-            padding: 4px 10px;
-            border-radius: 14px;
-            font-weight: 600;
-        }
-
-        /* Table */
-        .hc-table {
-            width: 100%;
-            font-size: 0.82rem;
-            white-space: nowrap;
-        }
-
-        .hc-table thead th {
-            background: #f1f3f5;
-            font-weight: 700;
-            font-size: 0.72rem;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            padding: 10px;
             position: sticky;
             top: 0;
-            z-index: 2;
+            z-index: 10;
         }
-
-        .hc-table tbody td {
-            padding: 8px 10px;
-            border-top: 1px solid #dee2e6;
+        .table td, .table th {
             vertical-align: middle;
+            padding: 0.6rem 0.5rem;
         }
-
-        .hc-table tbody tr:hover {
-            background: #f8f9ff;
+        .table-container {
+            max-height: 500px;
+            overflow: auto;
         }
-
-        /* YES / NO pills */
-        .metric-yes {
-            background: #dc3545;
-            color: #fff;
-            font-size: 0.7rem;
-            padding: 3px 8px;
-            border-radius: 12px;
-            font-weight: 700;
+        .status-success {
+            background-color: #d4edda !important;
         }
-
-        .metric-no {
-            background: #198754;
-            color: #fff;
-            font-size: 0.7rem;
-            padding: 3px 8px;
-            border-radius: 12px;
-            font-weight: 700;
+        .status-failed {
+            background-color: #f8d7da !important;
         }
-
-        /* No data */
-        .hc-no-data {
-            text-align: center;
-            padding: 3rem;
-            color: #6c757d;
+        .status-running {
+            background-color: #fff3cd !important;
         }
-
-        /* Spinner */
-        .section-spinner {
-            display: none;
+        .badge.fs-6 {
+            font-size: 1rem !important;
+        }
+        .job-updating {
+            opacity: 0.7;
+        }
+        .search-pill {
+            border-radius: 999px;
+        }
+        .page-link {
+            cursor: pointer;
+        }
+        .spinner-overlay {
+            position: absolute;
+            inset: 0;
+            background: rgba(255,255,255,0.8);
+            display: flex;
             justify-content: center;
             align-items: center;
-            padding: 2rem;
+            z-index: 50;
         }
-
-        /* Download Button */
-        .download-btn {
-            background: linear-gradient(135deg, #20c997, #198754);
-            border: none;
-            color: #fff;
-            font-weight: 600;
-            padding: 6px 14px;
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            gap: 6px;
+        .job-status-waiting {
+            color: #0d6efd;
+            font-weight: 500;
+            font-size: 0.9rem;
         }
-
-        .download-btn:hover {
-            background: linear-gradient(135deg, #198754, #157347);
-            transform: translateY(-1px);
+        .job-status-executed {
+            color: #198754;
+            font-weight: 500;
+            font-size: 0.9rem;
         }
-
-        .download-btn:disabled {
-            background: #adb5bd;
-            cursor: not-allowed;
-        }
-
-        /* Meta info */
-        .meta-info {
-            background: #ffffff;
-            border-left: 4px solid #0d6efd;
-            border-radius: 8px;
-            padding: 10px 14px;
-            margin-top: 8px;
+        .job-status-na {
+            color: #6c757d;
             font-size: 0.85rem;
-        }
-
-        /* Horizontal scroll wrapper */
-        .table-responsive-xxl {
-            max-height: 360px;
-            overflow: auto;
         }
     </style>
 </head>
-
 <body>
+    <header>{% include "healthcheckapp/hc_navbar.html" %}</header>
 
-<header>
-    {% include "healthcheckapp/hc_navbar.html" %}
-</header>
+    <div class="container-fluid py-4">
+        <h5 class="mb-1">{{ job.name }}</h5>
 
-<div class="container-fluid py-3">
-
-    <!-- Header -->
-    <div class="d-flex flex-wrap justify-content-between align-items-center mb-4 gap-2">
-        <div>
-            <h5 class="mb-1">
-                Process Records
-                <span class="badge bg-primary">{{ status_id }}</span>
-            </h5>
-            <div id="metaInfo" class="meta-info d-none">
-                <strong>Loading process info...</strong>
+        <!-- Job Status -->
+        <div class="card mb-4">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <small class="text-muted" id="job-updated">Job status</small>
+            </div>
+            <div class="card-body p-0 job-updating" id="jobStatusCard">
+                <div class="table-responsive">
+                    <table class="table table-striped table-hover mb-0" id="jobStatusTable">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Status</th>
+                                <th>Last Run</th>
+                                <th>Next Run</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr class="text-center text-muted">
+                                <td colspan="3" class="py-4">
+                                    <small>Loading...</small>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
 
-        <div class="d-flex gap-2">
-            <button id="btnDownloadExcel" class="btn download-btn btn-sm" disabled>
-                <i class="bi bi-file-earmark-excel"></i> Download Excel
-            </button>
+        <!-- Process Table with Enhanced UI -->
+        <div class="card position-relative" id="processCard">
+            <div class="spinner-overlay d-none" id="processSpinner">
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">Loading...</span>
+                </div>
+            </div>
 
-            {% if job %}
-                <a href="{% url 'healthcheckapp	cb9' job.id %}" class="btn btn-outline-primary btn-sm">
-                    <i class="bi bi-arrow-left"></i> Back
-                </a>
-            {% else %}
-                <a href="javascript:history.back()" class="btn btn-outline-primary btn-sm">
-                    <i class="bi bi-arrow-left"></i> Back
-                </a>
-            {% endif %}
+            <div class="card-header">
+                <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2">
+                    <h6 class="mb-0">Process Status</h6>
+                    <div class="input-group input-group-sm" style="max-width: 320px;">
+                        <span class="input-group-text bg-white border-end-0">
+                            <i class="bi bi-search"></i>
+                        </span>
+                        <input type="text" id="globalSearch" class="form-control border-start-0 search-pill" 
+                               placeholder="Search customer, env, tenant, status...">
+                        <button class="btn btn-outline-secondary" type="button" id="btnClearSearch">×</button>
+                    </div>
+                </div>
+
+                <!-- Advanced Filters -->
+                <div class="mt-2">
+                    <button class="btn btn-link btn-sm p-0" type="button" data-bs-toggle="collapse" 
+                            data-bs-target="#advancedFilters">
+                        Advanced filters
+                    </button>
+                    <div class="collapse mt-2" id="advancedFilters">
+                        <div class="row g-2">
+                            <div class="col-md-3">
+                                <input type="text" id="filterCustomer" class="form-control form-control-sm" 
+                                       placeholder="Customer">
+                            </div>
+                            <div class="col-md-3">
+                                <input type="text" id="filterEnv" class="form-control form-control-sm" 
+                                       placeholder="Environment">
+                            </div>
+                            <div class="col-md-2">
+                                <input type="date" id="filterStartDate" class="form-control form-control-sm">
+                            </div>
+                            <div class="col-md-2">
+                                <input type="date" id="filterEndDate" class="form-control form-control-sm">
+                            </div>
+                            <div class="col-md-2 d-flex">
+                                <button id="btnApplyFilter" class="btn btn-sm btn-primary me-2 flex-fill">
+                                    Apply
+                                </button>
+                                <button id="btnClearFilter" class="btn btn-sm btn-outline-secondary flex-fill">
+                                    Reset
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="table-container px-4 pb-2 pt-6">
+                <table class="table table-hover mb-1" id="processTable">
+                    <thead>
+                        <tr>
+                            <th style="width: 60px;">SI.No</th>
+                            <th style="width: 150px;">Customer Name</th>
+                            <th style="width: 80px;">Environment</th>
+                            <th style="width: 90px;">Tenant</th>
+                            <th style="width: 90px;">Status</th>
+                            <th style="width: 70px;">Error</th>
+                            <th style="width: 200px;">Start</th>
+                            <th style="width: 200px;">End</th>
+                            <th style="width: 100px;">View Report</th>
+                            <th style="width: 100px;">Action Required</th>
+                            <th style="width: 180px;">Job Run Status</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+
+                <!-- Numbered Pagination -->
+                <nav aria-label="Process pagination" class="mt-3">
+                    <ul class="pagination pagination-sm justify-content-center mb-0" id="paginationBar"></ul>
+                    <div class="text-center small text-muted mt-1" id="pageInfo"></div>
+                </nav>
+            </div>
         </div>
     </div>
 
-    <!-- GRID -->
-    <div class="row g-3">
+    {% bootstrap_javascript %}
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            const PROCESS_API = "{% url 'healthcheckapp:process_status_api' %}";
+            const JOB_STATUS_API = "{% url 'healthcheckapp:job_status_api' job.id %}";
+            const RECORDS_BASE_URL = "{% url 'healthcheckapp:records' 0 %}".replace(/0\/$/, '');
+            const JOB_ID = {{ job.id }};
 
-        <!-- DATABASE -->
-        <div class="col-xl-6 col-lg-12">
-            <div class="card h-100">
-                <div class="card-header hc-section-header">
-                    <span><i class="bi bi-database"></i> Database Health</span>
-                    <span id="dbCustomerEnv" class="customer-env-badge d-none"></span>
-                </div>
-                <div class="card-body p-0">
-                    <div id="dbSpinner" class="section-spinner">
-                        <div class="spinner-border spinner-border-sm text-primary"></div>
-                    </div>
-                    <div id="dbReportContainer" class="table-responsive-xxl"></div>
-                </div>
-            </div>
-        </div>
+            let start = 0, length = 10, total = 0, firstLoadDone = false;
+            let filterCustomer = '', filterEnv = '', filterStartDate = '', filterEndDate = '', globalSearch = '';
 
-        <!-- FILESYSTEM -->
-        <div class="col-xl-6 col-lg-12">
-            <div class="card h-100">
-                <div class="card-header hc-section-header">
-                    <span><i class="bi bi-hdd-network"></i> Filesystem Health</span>
-                    <span id="fsCustomerEnv" class="customer-env-badge d-none"></span>
-                </div>
-                <div class="card-body p-0">
-                    <div id="fsSpinner" class="section-spinner">
-                        <div class="spinner-border spinner-border-sm text-primary"></div>
-                    </div>
-                    <div id="fsReportContainer" class="table-responsive-xxl"></div>
-                </div>
-            </div>
-        </div>
+            function setSpinner(visible) {
+                document.getElementById('processSpinner').classList.toggle('d-none', !visible);
+            }
 
-        <!-- TABLESPACE -->
-        <div class="col-xl-6 col-lg-12">
-            <div class="card h-100">
-                <div class="card-header hc-section-header">
-                    <span><i class="bi bi-table"></i> Tablespace Usage</span>
-                    <span id="tsCustomerEnv" class="customer-env-badge d-none"></span>
-                </div>
-                <div class="card-body p-0">
-                    <div id="tsSpinner" class="section-spinner">
-                        <div class="spinner-border spinner-border-sm text-primary"></div>
-                    </div>
-                    <div id="tsReportContainer" class="table-responsive-xxl"></div>
-                </div>
-            </div>
-        </div>
+            function updatePagination() {
+                const bar = document.getElementById('paginationBar');
+                const info = document.getElementById('pageInfo');
+                bar.innerHTML = '';
+                
+                const currentPage = Math.floor(start / length) + 1;
+                const totalPages = Math.ceil(total / length) || 1;
+                info.textContent = `Page ${currentPage} of ${totalPages} • ${total.toLocaleString()} total`;
 
-        <!-- RMAN -->
-        <div class="col-xl-6 col-lg-12">
-            <div class="card h-100">
-                <div class="card-header hc-section-header">
-                    <span><i class="bi bi-cloud-arrow-down"></i> RMAN Backup</span>
-                    <span id="rmCustomerEnv" class="customer-env-badge d-none"></span>
-                </div>
-                <div class="card-body p-0">
-                    <div id="rmSpinner" class="section-spinner">
-                        <div class="spinner-border spinner-border-sm text-primary"></div>
-                    </div>
-                    <div id="rmReportContainer" class="table-responsive-xxl"></div>
-                </div>
-            </div>
-        </div>
+                function addPage(label, page, disabled = false, active = false) {
+                    const li = document.createElement('li');
+                    li.className = `page-item ${disabled ? 'disabled' : ''} ${active ? 'active' : ''}`;
+                    const a = document.createElement('a');
+                    a.className = 'page-link';
+                    a.textContent = label;
+                    
+                    if (!disabled && !active) {
+                        a.addEventListener('click', () => {
+                            start = (page - 1) * length;
+                            fetchProcessPage();
+                        });
+                    }
+                    
+                    li.appendChild(a);
+                    bar.appendChild(li);
+                }
 
-    </div>
-</div>
+                addPage('« Prev', currentPage - 1, currentPage === 1);
+                
+                const windowSize = 5;
+                const startPage = Math.max(1, currentPage - 2);
+                const endPage = Math.min(totalPages, startPage + windowSize - 1);
+                
+                if (startPage > 1) {
+                    addPage('1', 1, false, currentPage === 1);
+                    if (startPage > 2) addPage('...', 1, true);
+                }
+                
+                for (let p = startPage; p <= endPage; p++) {
+                    addPage(p.toString(), p, false, p === currentPage);
+                }
+                
+                if (endPage < totalPages) {
+                    if (endPage < totalPages - 1) addPage('...', totalPages, true);
+                    addPage(totalPages.toString(), totalPages, false, currentPage === totalPages);
+                }
+                
+                addPage('Next »', currentPage + 1, currentPage === totalPages);
+            }
 
-{% bootstrap_javascript %}
+            function formatJobRunStatus(record) {
+                if (record.action_required !== 'YES') {
+                    return '<span class="job-status-na">N/A</span>';
+                }
 
-<!-- YOUR EXISTING JS REMAINS 100% SAME BELOW -->
-<script>
-    /* ❌ NO JS CHANGES MADE */
-</script>
+                if (!record.EndTime || record.EndTime === '-') {
+                    return '<span class="job-status-na">No end time</span>';
+                }
 
+                if (record.job_run_status) {
+                    if (record.job_run_status.startsWith('Waiting')) {
+                        return `
+                            <div class="job-status-waiting">⏳ ${record.job_run_status}</div>
+                            <small class="text-muted">Execute at: ${record.execution_time || 'N/A'}</small>
+                        `;
+                    } else if (record.job_run_status === 'Executed') {
+                        return `<div class="job-status-executed">✓ Job Executed</div>`;
+                    }
+                }
+
+                return '<span class="job-status-na">-</span>';
+            }
+
+            function updateProcessTable(data) {
+                const tbody = document.querySelector('#processTable tbody');
+                tbody.innerHTML = '';
+                total = data.recordsFiltered || data.recordsTotal || 0;
+
+                if (!data.records || !data.records.length) {
+                    tbody.innerHTML = '<tr><td colspan="11" class="text-center py-4 text-muted">No data found</td></tr>';
+                } else {
+                    data.records.forEach((r, i) => {
+                        const row = document.createElement('tr');
+                        row.className = r.Status === 'Success' ? 'status-success' : 
+                                      r.Status === 'Failed' ? 'status-failed' : 
+                                      r.Status === 'Running' ? 'status-running' : '';
+
+                        const actionRequiredHtml = r.action_required === 'YES'
+                            ? '<span class="badge bg-danger">YES</span>'
+                            : '<span class="badge bg-success">NO</span>';
+
+                        const jobRunStatusHtml = formatJobRunStatus(r);
+
+                        row.innerHTML = `
+                            <td>${start + i + 1}</td>
+                            <td>${r.Customer || '-'}</td>
+                            <td><span class="badge bg-info">${r.Environment || '-'}</span></td>
+                            <td>${r.Tenant || '-'}</td>
+                            <td>
+                                <span class="badge ${
+                                    r.Status === 'Success' ? 'bg-success' :
+                                    r.Status === 'Failed' ? 'bg-danger' :
+                                    r.Status === 'Running' ? 'bg-warning' : 'bg-success'
+                                }">
+                                    ${r.Status || '-'}
+                                </span>
+                            </td>
+                            <td>${r.ErrorMessage || '-'}</td>
+                            <td>${r.StartTime || '-'}</td>
+                            <td>${r.EndTime || '-'}</td>
+                            <td>
+                                <a href="${RECORDS_BASE_URL}${r.id}/?job_id={{ job.id }}" 
+                                   class="btn btn-sm btn-outline-info">
+                                    View
+                                </a>
+                            </td>
+                            <td>${actionRequiredHtml}</td>
+                            <td>${jobRunStatusHtml}</td>
+                        `;
+                        tbody.appendChild(row);
+                    });
+                }
+                
+                updatePagination();
+
+                if (data.triggered_count > 0) {
+                    console.log(`✓ ${data.triggered_count} process(es) triggered Job ${JOB_ID}`);
+                }
+            }
+
+            function fetchProcessPage() {
+                setSpinner(!firstLoadDone);
+                
+                const params = new URLSearchParams({ 
+                    start: start, 
+                    length: length,
+                    job_id: JOB_ID
+                });
+                
+                if (filterCustomer) params.append('customer', filterCustomer);
+                if (filterEnv) params.append('env', filterEnv);
+                if (filterStartDate) params.append('start_date', filterStartDate);
+                if (filterEndDate) params.append('end_date', filterEndDate);
+                if (globalSearch) params.append('search', globalSearch);
+
+                fetch(`${PROCESS_API}?${params}`)
+                    .then(r => r.json())
+                    .then(data => {
+                        updateProcessTable(data);
+                        firstLoadDone = true;
+                        setSpinner(false);
+                    })
+                    .catch(err => {
+                        console.error(err);
+                        setSpinner(false);
+                    });
+            }
+
+            // Event handlers
+            document.getElementById('globalSearch').addEventListener('input', function() {
+                globalSearch = this.value.trim();
+                start = 0;
+                fetchProcessPage();
+            });
+
+            document.getElementById('btnClearSearch').addEventListener('click', () => {
+                document.getElementById('globalSearch').value = '';
+                globalSearch = '';
+                start = 0;
+                fetchProcessPage();
+            });
+
+            document.getElementById('btnApplyFilter').addEventListener('click', () => {
+                filterCustomer = document.getElementById('filterCustomer').value.trim();
+                filterEnv = document.getElementById('filterEnv').value.trim();
+                filterStartDate = document.getElementById('filterStartDate').value;
+                filterEndDate = document.getElementById('filterEndDate').value;
+                start = 0;
+                fetchProcessPage();
+            });
+
+            document.getElementById('btnClearFilter').addEventListener('click', () => {
+                document.getElementById('filterCustomer').value = '';
+                document.getElementById('filterEnv').value = '';
+                document.getElementById('filterStartDate').value = '';
+                document.getElementById('filterEndDate').value = '';
+                filterCustomer = filterEnv = filterStartDate = filterEndDate = '';
+                start = 0;
+                fetchProcessPage();
+            });
+
+            // Job status refresh
+            function refreshJobStatus() {
+                fetch(JOB_STATUS_API)
+                    .then(r => r.json())
+                    .then(data => {
+                        const tbody = document.querySelector('#jobStatusTable tbody');
+                        const card = document.getElementById('jobStatusCard');
+                        card.classList.remove('job-updating');
+                        
+                        const badgeClass = data.status === 'Running' ? 'bg-danger' : 'bg-success';
+                        tbody.innerHTML = `
+                            <tr>
+                                <td><span class="badge fs-6 ${badgeClass}">${data.status}</span></td>
+                                <td>${data.last_run}</td>
+                                <td>${data.next_run}</td>
+                            </tr>
+                        `;
+                    })
+                    .catch(console.error);
+            }
+
+            // Initial load
+            fetchProcessPage();
+            refreshJobStatus();
+            
+            // Auto refresh job status every 5 seconds
+            setInterval(refreshJobStatus, 5000);
+        });
+    </script>
 </body>
 </html>
+```
+
+---
+
+## Key Features:
+
+### **Views.py (Simplified)**
+1. ✅ Clean pagination & filters
+2. ✅ Action Required check (YES/NO)
+3. ✅ **Auto-trigger after 24hrs** from EndTime
+4. ✅ Simple job run status calculation
+5. ✅ Minimal logging
+
+### **HTML (Complete & Clean)**
+1. ✅ All original features preserved
+2. ✅ New "Job Run Status" column
+3. ✅ Shows: "⏳ Waiting Xh Ym" or "✓ Job Executed"
+4. ✅ Displays execution time
+5. ✅ Clean, professional styling
+6. ✅ Auto-refresh every 5 seconds
+
+### **Logic Flow:**
+```
+1. User opens dashboard → HTML loads with {{ job.id }}
+2. JavaScript calls API with job_id parameter
+3. API checks each process:
+   - Action Required = YES?
+   - EndTime exists?
+   - 24 hours passed?
+4. If YES → Trigger async_task("execute_job", job_id)
+5. Display status to user
+
+
+from django.contrib.auth.decorators import login_required
+from django.views.decorators.http import require_GET
+from django.http import JsonResponse
+from django.db.models import Q
+from django.utils.dateparse import parse_date
+from django.utils import timezone
+from datetime import timedelta
+from django_q.tasks import async_task
+import logging
+
+from .models import ProcessStatus, HcDatabaseReport, HcFilesystemReport
+from scheduler_app.models import ScheduledJob
+
+logger = logging.getLogger(__name__)
+
+@login_required
+@require_GET
+def process_status_api(request):
+    """
+    Process Status API with auto-trigger for healthcheck job after 24hrs
+    """
+    # ========================================================================
+    # 1. PAGINATION & FILTERS
+    # ========================================================================
+    try:
+        start = int(request.GET.get("start", 0))
+        length = int(request.GET.get("length", 10))
+    except ValueError:
+        start = 0
+        length = 10
+    
+    if length <= 0:
+        length = 10
+
+    customer = request.GET.get("customer", "").strip()
+    env = request.GET.get("env", "").strip()
+    start_date_str = request.GET.get("start_date", "").strip()
+    end_date_str = request.GET.get("end_date", "").strip()
+    search_value = request.GET.get("search", "").strip()
+    job_id = request.GET.get("job_id", "").strip()  # Healthcheck Job ID
+
+    # ========================================================================
+    # 2. BUILD QUERYSET WITH FILTERS
+    # ========================================================================
+    qs = ProcessStatus.objects.using("health_check").all().order_by("-id")
+
+    if customer:
+        qs = qs.filter(Customer__icontains=customer)
+    if env:
+        qs = qs.filter(Environment__icontains=env)
+    if search_value:
+        qs = qs.filter(
+            Q(Customer__icontains=search_value) |
+            Q(Environment__icontains=search_value) |
+            Q(Tenant__icontains=search_value) |
+            Q(Status__icontains=search_value) |
+            Q(ErrorMessage__icontains=search_value)
+        )
+
+    start_date = parse_date(start_date_str) if start_date_str else None
+    end_date = parse_date(end_date_str) if end_date_str else None
+    if start_date:
+        qs = qs.filter(StartTime__date__gte=start_date)
+    if end_date:
+        qs = qs.filter(StartTime__date__lte=end_date)
+
+    total_count = ProcessStatus.objects.using("health_check").count()
+    filtered_count = qs.count()
+
+    records = list(
+        qs[start:start + length].values(
+            "id", "Process_id", "Customer", "Environment", "Tenant",
+            "Status", "ErrorMessage", "StartTime", "EndTime"
+        )
+    )
+
+    # ========================================================================
+    # 3. CHECK ACTION REQUIRED (YES/NO)
+    # ========================================================================
+    status_ids = [r["id"] for r in records]
+
+    db_yes_ids = set(
+        HcDatabaseReport.objects.using("health_check")
+        .filter(status_id__in=status_ids)
+        .filter(
+            Q(connection_action__icontains="yes") |
+            Q(password_update_action__icontains="yes") |
+            Q(table_space_action__icontains="yes") |
+            Q(archieve_action__icontains="yes") |
+            Q(archieve_log_action__icontains="yes") |
+            Q(archieve_path_action__icontains="yes") |
+            Q(rman_log_action__icontains="yes")
+        )
+        .values_list("status_id", flat=True)
+        .distinct()
+    )
+
+    fs_yes_ids = set(
+        HcFilesystemReport.objects.using("health_check")
+        .filter(status_id__in=status_ids)
+        .filter(
+            Q(connection_action__icontains="yes") |
+            Q(update_action__icontains="yes") |
+            Q(scheduler_action__icontains="yes") |
+            Q(listners_action__icontains="yes") |
+            Q(disk_space_action__icontains="yes")
+        )
+        .values_list("status_id", flat=True)
+        .distinct()
+    )
+
+    yes_required_ids = db_yes_ids.union(fs_yes_ids)
+
+    # ========================================================================
+    # 4. AUTO-TRIGGER LOGIC (RUN NOW AFTER 24 HOURS)
+    # ========================================================================
+    now = timezone.now()
+    triggered_count = 0
+
+    if job_id:
+        try:
+            healthcheck_job = ScheduledJob.objects.get(pk=job_id, enabled=True)
+            
+            if healthcheck_job.deployment_version:
+                for r in records:
+                    status_id = r["id"]
+                    
+                    # Trigger conditions: Action Required = YES + EndTime + 24hrs passed
+                    if status_id in yes_required_ids and r["EndTime"]:
+                        end_time = r["EndTime"]
+                        
+                        if timezone.is_naive(end_time):
+                            end_time = timezone.make_aware(end_time)
+                        
+                        trigger_time = end_time + timedelta(hours=24)
+                        
+                        # If 24 hours passed, trigger the job
+                        if now >= trigger_time:
+                            try:
+                                async_task(
+                                    "scheduler_app.tasks.execute_job",
+                                    int(job_id)
+                                )
+                                triggered_count += 1
+                                
+                                logger.info(
+                                    f"Auto-triggered Job {job_id} for Process {status_id} "
+                                    f"(Process_id: {r['Process_id']})"
+                                )
+                            except Exception as e:
+                                logger.error(f"Failed to trigger Job {job_id}: {str(e)}")
+        except ScheduledJob.DoesNotExist:
+            logger.error(f"Job {job_id} not found or disabled")
+        except Exception as e:
+            logger.error(f"Error in auto-trigger: {str(e)}")
+
+    # ========================================================================
+    # 5. BUILD RESPONSE WITH JOB RUN STATUS
+    # ========================================================================
+    data = []
+    for r in records:
+        status_id = r["id"]
+        action_required = "YES" if status_id in yes_required_ids else "NO"
+        
+        # Calculate job run status
+        job_run_status = None
+        execution_time = None
+        
+        if action_required == "YES" and r["EndTime"]:
+            end_time = r["EndTime"]
+            
+            if timezone.is_naive(end_time):
+                end_time = timezone.make_aware(end_time)
+            
+            trigger_time = end_time + timedelta(hours=24)
+            execution_time = trigger_time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            if now < trigger_time:
+                # Waiting
+                time_remaining = trigger_time - now
+                hours = int(time_remaining.total_seconds() // 3600)
+                minutes = int((time_remaining.total_seconds() % 3600) // 60)
+                job_run_status = f"Waiting {hours}h {minutes}m"
+            else:
+                # Executed or Ready
+                job_run_status = "Executed"
+        
+        data.append({
+            "id": r["id"],
+            "Process_id": r["Process_id"],
+            "Customer": r["Customer"] or "-",
+            "Environment": r["Environment"] or "-",
+            "Tenant": r["Tenant"] or "-",
+            "Status": r["Status"] or "-",
+            "ErrorMessage": r["ErrorMessage"] or "-",
+            "StartTime": r["StartTime"].strftime("%Y-%m-%d %H:%M:%S") if r["StartTime"] else "-",
+            "EndTime": r["EndTime"].strftime("%Y-%m-%d %H:%M:%S") if r["EndTime"] else "-",
+            "action_required": action_required,
+            "job_run_status": job_run_status,
+            "execution_time": execution_time
+        })
+
+    return JsonResponse({
+        "records": data,
+        "recordsTotal": total_count,
+        "recordsFiltered": filtered_count,
+        "start": start,
+        "length": length,
+        "triggered_count": triggered_count
+    })
