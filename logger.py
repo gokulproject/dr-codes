@@ -1,4 +1,4 @@
-{% load static %}
+uu{% load static %}
 {% load django_bootstrap5 %}
 <!DOCTYPE html>
 <html lang="en">
@@ -677,3 +677,316 @@ def process_status_api(request):
         "length": length,
         "triggered_count": triggered_count
     })
+
+
+
+
+
+
+
+from django.contrib.auth.decorators import login_required
+from django.views.decorators.http import require_GET
+from django.http import JsonResponse
+from django.db.models import Q
+from django.utils.dateparse import parse_date
+from django.utils import timezone
+from datetime import timedelta, datetime
+from django_q.tasks import async_task
+import pytz
+import logging
+
+from .models import ProcessStatus, HcDatabaseReport, HcFilesystemReport
+from scheduler_app.models import ScheduledJob
+
+logger = logging.getLogger(__name__)
+
+@login_required
+@require_GET
+def process_status_api(request):
+    """
+    Process Status API with auto-trigger for healthcheck job
+    
+    TRIGGER LOGIC:
+    - Check all processes with action_required = YES
+    - For each process, check if: Current UTC Time > (EndTime + 24 hours)
+    - If ANY process meets this condition, trigger the job ONCE
+    - Job will handle all processes that need action
+    """
+    # ========================================================================
+    # 1. PAGINATION & FILTERS
+    # ========================================================================
+    try:
+        start = int(request.GET.get("start", 0))
+        length = int(request.GET.get("length", 10))
+    except ValueError:
+        start = 0
+        length = 10
+    
+    if length <= 0:
+        length = 10
+
+    customer = request.GET.get("customer", "").strip()
+    env = request.GET.get("env", "").strip()
+    start_date_str = request.GET.get("start_date", "").strip()
+    end_date_str = request.GET.get("end_date", "").strip()
+    search_value = request.GET.get("search", "").strip()
+    job_id = request.GET.get("job_id", "").strip()
+
+    # ========================================================================
+    # 2. BUILD QUERYSET WITH FILTERS
+    # ========================================================================
+    qs = ProcessStatus.objects.using("health_check").all().order_by("-id")
+
+    if customer:
+        qs = qs.filter(Customer__icontains=customer)
+    if env:
+        qs = qs.filter(Environment__icontains=env)
+    if search_value:
+        qs = qs.filter(
+            Q(Customer__icontains=search_value) |
+            Q(Environment__icontains=search_value) |
+            Q(Tenant__icontains=search_value) |
+            Q(Status__icontains=search_value) |
+            Q(ErrorMessage__icontains=search_value)
+        )
+
+    start_date = parse_date(start_date_str) if start_date_str else None
+    end_date = parse_date(end_date_str) if end_date_str else None
+    if start_date:
+        qs = qs.filter(StartTime__date__gte=start_date)
+    if end_date:
+        qs = qs.filter(StartTime__date__lte=end_date)
+
+    total_count = ProcessStatus.objects.using("health_check").count()
+    filtered_count = qs.count()
+
+    records = list(
+        qs[start:start + length].values(
+            "id", "Process_id", "Customer", "Environment", "Tenant",
+            "Status", "ErrorMessage", "StartTime", "EndTime"
+        )
+    )
+
+    # ========================================================================
+    # 3. CHECK ACTION REQUIRED (YES/NO)
+    # ========================================================================
+    status_ids = [r["id"] for r in records]
+
+    db_yes_ids = set(
+        HcDatabaseReport.objects.using("health_check")
+        .filter(status_id__in=status_ids)
+        .filter(
+            Q(connection_action__icontains="yes") |
+            Q(password_update_action__icontains="yes") |
+            Q(table_space_action__icontains="yes") |
+            Q(archieve_action__icontains="yes") |
+            Q(archieve_log_action__icontains="yes") |
+            Q(archieve_path_action__icontains="yes") |
+            Q(rman_log_action__icontains="yes")
+        )
+        .values_list("status_id", flat=True)
+        .distinct()
+    )
+
+    fs_yes_ids = set(
+        HcFilesystemReport.objects.using("health_check")
+        .filter(status_id__in=status_ids)
+        .filter(
+            Q(connection_action__icontains="yes") |
+            Q(update_action__icontains="yes") |
+            Q(scheduler_action__icontains="yes") |
+            Q(listners_action__icontains="yes") |
+            Q(disk_space_action__icontains="yes")
+        )
+        .values_list("status_id", flat=True)
+        .distinct()
+    )
+
+    yes_required_ids = db_yes_ids.union(fs_yes_ids)
+
+    # ========================================================================
+    # 4. GET CURRENT UTC TIME
+    # ========================================================================
+    utc_now = datetime.now(pytz.UTC)
+    
+    logger.info(f"========================================")
+    logger.info(f"API Called at UTC: {utc_now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    logger.info(f"========================================")
+
+    # ========================================================================
+    # 5. AUTO-TRIGGER LOGIC - TRIGGER JOB ONLY ONCE IF ANY PROCESS IS READY
+    # ========================================================================
+    job_triggered = False
+    processes_ready_for_trigger = []
+
+    if job_id:
+        try:
+            healthcheck_job = ScheduledJob.objects.get(pk=job_id, enabled=True)
+            
+            if not healthcheck_job.deployment_version:
+                logger.warning(f"Job {job_id} has no deployment version.")
+            else:
+                # Check ALL records (not just paginated ones) for processes ready to trigger
+                all_records = list(
+                    ProcessStatus.objects.using("health_check")
+                    .filter(id__in=yes_required_ids)
+                    .values("id", "Process_id", "Customer", "Environment", "EndTime")
+                )
+                
+                logger.info(f"Checking {len(all_records)} processes with action_required=YES")
+                
+                for r in all_records:
+                    status_id = r["id"]
+                    process_id = r["Process_id"] or "N/A"
+                    
+                    # Check if EndTime exists
+                    if not r["EndTime"]:
+                        logger.debug(f"Process {status_id} - No EndTime, skipping")
+                        continue
+                    
+                    end_time = r["EndTime"]
+                    
+                    # Convert EndTime to UTC
+                    if timezone.is_naive(end_time):
+                        end_time_utc = pytz.UTC.localize(end_time)
+                    elif end_time.tzinfo != pytz.UTC:
+                        end_time_utc = end_time.astimezone(pytz.UTC)
+                    else:
+                        end_time_utc = end_time
+                    
+                    # Calculate trigger time (EndTime + 24 hours)
+                    trigger_time_utc = end_time_utc + timedelta(hours=24)
+                    
+                    # Check if current time is AFTER trigger time
+                    if utc_now > trigger_time_utc:
+                        hours_overdue = (utc_now - trigger_time_utc).total_seconds() / 3600
+                        
+                        processes_ready_for_trigger.append({
+                            'status_id': status_id,
+                            'process_id': process_id,
+                            'customer': r['Customer'],
+                            'environment': r['Environment'],
+                            'end_time_utc': end_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                            'trigger_time_utc': trigger_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                            'hours_overdue': round(hours_overdue, 1)
+                        })
+                        
+                        logger.info(
+                            f"✓ Process {status_id} (Process_id: {process_id}) is READY\n"
+                            f"  EndTime (UTC): {end_time_utc.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"  Trigger Time (UTC): {trigger_time_utc.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"  Current Time (UTC): {utc_now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"  Overdue: {hours_overdue:.1f} hours"
+                        )
+                
+                # If ANY process is ready, trigger the job ONCE
+                if processes_ready_for_trigger and not job_triggered:
+                    try:
+                        task_id = async_task(
+                            "scheduler_app.tasks.execute_job",
+                            int(job_id)
+                        )
+                        
+                        job_triggered = True
+                        
+                        logger.info(
+                            f"\n{'='*60}\n"
+                            f"✓✓✓ JOB TRIGGERED ✓✓✓\n"
+                            f"Job ID: {job_id}\n"
+                            f"Task ID: {task_id}\n"
+                            f"Triggered at (UTC): {utc_now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"Reason: {len(processes_ready_for_trigger)} process(es) ready for action\n"
+                            f"{'='*60}\n"
+                        )
+                        
+                        for p in processes_ready_for_trigger:
+                            logger.info(
+                                f"  → Process {p['status_id']} ({p['process_id']}) - "
+                                f"{p['customer']}/{p['environment']} - "
+                                f"Overdue: {p['hours_overdue']}h"
+                            )
+                    
+                    except Exception as e:
+                        logger.error(f"✗ Failed to trigger Job {job_id}: {str(e)}")
+                else:
+                    if not processes_ready_for_trigger:
+                        logger.info("No processes ready for trigger yet. All are waiting.")
+                        
+        except ScheduledJob.DoesNotExist:
+            logger.error(f"Job {job_id} not found or disabled")
+        except Exception as e:
+            logger.error(f"Error in auto-trigger logic: {str(e)}")
+    else:
+        logger.warning("No job_id provided. Auto-trigger disabled.")
+
+    # ========================================================================
+    # 6. BUILD RESPONSE WITH JOB RUN STATUS
+    # ========================================================================
+    data = []
+    
+    for r in records:
+        status_id = r["id"]
+        action_required = "YES" if status_id in yes_required_ids else "NO"
+        
+        job_run_status = None
+        execution_time = None
+        
+        if action_required == "YES" and r["EndTime"]:
+            end_time = r["EndTime"]
+            
+            # Convert EndTime to UTC
+            if timezone.is_naive(end_time):
+                end_time_utc = pytz.UTC.localize(end_time)
+            elif end_time.tzinfo != pytz.UTC:
+                end_time_utc = end_time.astimezone(pytz.UTC)
+            else:
+                end_time_utc = end_time
+            
+            # Calculate trigger time
+            trigger_time_utc = end_time_utc + timedelta(hours=24)
+            execution_time = trigger_time_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+            
+            if utc_now > trigger_time_utc:
+                # Past trigger time
+                if job_triggered:
+                    job_run_status = "Executed"
+                else:
+                    hours_overdue = int((utc_now - trigger_time_utc).total_seconds() // 3600)
+                    job_run_status = f"Ready ({hours_overdue}h overdue)"
+            else:
+                # Still waiting
+                time_remaining = trigger_time_utc - utc_now
+                hours = int(time_remaining.total_seconds() // 3600)
+                minutes = int((time_remaining.total_seconds() % 3600) // 60)
+                job_run_status = f"Waiting {hours}h {minutes}m"
+        
+        data.append({
+            "id": r["id"],
+            "Process_id": r["Process_id"],
+            "Customer": r["Customer"] or "-",
+            "Environment": r["Environment"] or "-",
+            "Tenant": r["Tenant"] or "-",
+            "Status": r["Status"] or "-",
+            "ErrorMessage": r["ErrorMessage"] or "-",
+            "StartTime": r["StartTime"].strftime("%Y-%m-%d %H:%M:%S") if r["StartTime"] else "-",
+            "EndTime": r["EndTime"].strftime("%Y-%m-%d %H:%M:%S") if r["EndTime"] else "-",
+            "action_required": action_required,
+            "job_run_status": job_run_status,
+            "execution_time": execution_time
+        })
+
+    response_data = {
+        "records": data,
+        "recordsTotal": total_count,
+        "recordsFiltered": filtered_count,
+        "start": start,
+        "length": length,
+        "job_triggered": job_triggered,
+        "processes_ready_count": len(processes_ready_for_trigger),
+        "server_utc_time": utc_now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    }
+    
+    if processes_ready_for_trigger:
+        response_data["processes_ready"] = processes_ready_for_trigger
+
+    return JsonResponse(response_data)
