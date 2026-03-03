@@ -102,3 +102,18 @@
     </script>
 </body>
 </html>
+
+from django.contrib import admin
+from django.contrib.auth.models import User, Group
+from django.contrib.auth.admin import UserAdmin, GroupAdmin
+
+class StaffAdminSite(admin.AdminSite):
+    site_header = "Admin Portal"
+
+    def has_permission(self, request):
+        return request.user.is_active and request.user.is_staff
+
+staff_admin_site = StaffAdminSite(name='staff_admin')
+
+staff_admin_site.register(User, UserAdmin)
+staff_admin_site.register(Group, GroupAdmin)
