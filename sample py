@@ -635,3 +635,13 @@ B2BIUser.objects.create_superuser(
 )
 print("Done:", B2BIUser.objects.get(username="b2bi_admin").is_staff)
 # Output: Done: True
+
+
+
+from django.db import connection
+
+with connection.cursor() as cursor:
+    cursor.execute("PRAGMA table_info(b2bi_auth_user)")
+    columns = cursor.fetchall()
+    for col in columns:
+        print(f"Column: {col[1]}  |  Type: {col[2]}  |  Nullable: {col[3]}")
