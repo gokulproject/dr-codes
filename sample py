@@ -1,0 +1,277 @@
+updated the email to user name
+
+
+
+Updated backends.py
+# b2bi/backends.py
+
+from b2bi.models import B2BIUser
+
+
+class B2BIAuthBackend:
+
+    def authenticate(self, request, username=None, password=None, **kwargs):
+        if not username:
+            return None
+        try:
+            user = B2BIUser.objects.get(username=username)   # ← username now
+            if user.check_password(password) and user.is_active:
+                return user
+        except B2BIUser.DoesNotExist:
+            return None
+
+    def get_user(self, user_id):
+        try:
+            return B2BIUser.objects.get(pk=user_id)
+        except B2BIUser.DoesNotExist:
+            return None
+
+
+
+
+
+
+
+Updated admin.py — list_display & fieldsets
+# b2bi/admin.py  — only the changed sections shown
+
+# ── List View ──────────────────────────────────────────────────────────────────
+list_display = [
+    "username",
+    "get_full_name",
+    "is_active_badge",
+    "is_staff_badge",
+    "is_superuser_badge",
+    "group_list",
+    "date_joined",
+]
+search_fields = ["username", "first_name", "last_name"]
+
+# ── CHANGE form layout ─────────────────────────────────────────────────────────
+fieldsets = (
+    (_("Login Credentials"), {
+        "fields": ("username", "password"),
+    }),
+    (_("Personal Information"), {
+        "fields": ("first_name", "last_name"),     # ← phone removed
+    }),
+    (_("Permissions & Access"), {
+        "fields": ("is_active", "is_staff", "is_superuser"),
+    }),
+    (_("B2BI Groups"), {
+        "fields": ("b2bi_groups",),
+    }),
+    (_("Important Dates"), {
+        "fields": ("last_login", "date_joined"),
+        "classes": ("collapse",),
+    }),
+)
+
+# ── ADD form layout ────────────────────────────────────────────────────────────
+add_fieldsets = (
+    (_("Account Credentials"), {
+        "classes": ("wide",),
+        "fields": ("username", "password1", "password2"),
+    }),
+    (_("Personal Information"), {
+        "classes": ("wide",),
+        "fields": ("first_name", "last_name"),     # ← phone removed
+    }),
+    (_("Permissions & Access"), {
+        "classes": ("wide",),
+        "fields": ("is_active", "is_staff", "is_superuser"),
+    }),
+    (_("B2BI Groups"), {
+        "classes": ("wide",),
+        "fields": ("b2bi_groups",),
+    }),
+)
+
+
+
+
+
+
+Updated forms.py
+# b2bi/forms.py
+
+from django import forms
+from django.contrib.auth.forms import ReadOnlyPasswordHashField
+from django.core.exceptions import ValidationError
+from .models import B2BIUser, B2BIGroup
+
+
+class B2BIUserCreationForm(forms.ModelForm):
+    password1 = forms.CharField(
+        label="Password",
+        widget=forms.PasswordInput(attrs={"autocomplete": "new-password"}),
+    )
+    password2 = forms.CharField(
+        label="Confirm Password",
+        widget=forms.PasswordInput(attrs={"autocomplete": "new-password"}),
+        help_text="Enter the same password as above.",
+    )
+
+    class Meta:
+        model  = B2BIUser
+        fields = (
+            "username",
+            "first_name",
+            "last_name",
+            "is_active",
+            "is_staff",
+            "is_superuser",
+            "b2bi_groups",
+        )
+
+    def clean_password2(self):
+        p1 = self.cleaned_data.get("password1")
+        p2 = self.cleaned_data.get("password2")
+        if p1 and p2 and p1 != p2:
+            raise ValidationError("Passwords do not match.")
+        return p2
+
+    def save(self, commit=True):
+        user = super().save(commit=False)
+        user.set_password(self.cleaned_data["password1"])
+        if commit:
+            user.save()
+            self.save_m2m()
+        return user
+
+
+class B2BIUserChangeForm(forms.ModelForm):
+    password = ReadOnlyPasswordHashField(
+        label="Password",
+        help_text='Raw passwords are not stored. Use <a href="../password/">this form</a> to change it.',
+    )
+
+    class Meta:
+        model  = B2BIUser
+        fields = (
+            "username",
+            "first_name",
+            "last_name",
+            "password",
+            "is_active",
+            "is_staff",
+            "is_superuser",
+            "b2bi_groups",
+        )
+
+
+class B2BIGroupForm(forms.ModelForm):
+    class Meta:
+        model   = B2BIGroup
+        fields  = ("name", "description")
+        widgets = {"description": forms.Textarea(attrs={"rows": 3})}
+
+
+
+
+
+
+
+
+
+# b2bi/models.py
+
+from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
+from django.db import models
+
+
+class B2BIUserManager(BaseUserManager):
+
+    def create_user(self, username, password=None, **extra_fields):
+        if not username:
+            raise ValueError("Username is required")
+        user = self.model(username=username, **extra_fields)
+        user.set_password(password)
+        user.save(using=self._db)
+        return user
+
+    def create_superuser(self, username, password=None, **extra_fields):
+        extra_fields.setdefault("is_staff",     True)
+        extra_fields.setdefault("is_superuser", True)
+        extra_fields.setdefault("is_active",    True)
+        return self.create_user(username, password, **extra_fields)
+
+
+class B2BIGroup(models.Model):
+    name        = models.CharField(max_length=150, unique=True)
+    description = models.TextField(blank=True, null=True)
+    created_at  = models.DateTimeField(auto_now_add=True)
+    updated_at  = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        app_label           = "b2bi"
+        db_table            = "b2bi_auth_group"
+        verbose_name        = "B2BI Group"
+        verbose_name_plural = "B2BI Groups"
+        ordering            = ["name"]
+
+
+class B2BIUser(AbstractBaseUser, PermissionsMixin):
+
+    # ── Core Fields ────────────────────────────────────────────────────────────
+    username   = models.CharField(max_length=150, unique=True, verbose_name="Username")
+    first_name = models.CharField(max_length=100, blank=True)
+    last_name  = models.CharField(max_length=100, blank=True)
+
+    # ── Permission Flags ───────────────────────────────────────────────────────
+    is_active    = models.BooleanField(default=True,  verbose_name="Active")
+    is_staff     = models.BooleanField(default=False, verbose_name="Staff (b2bi-admin access)")
+    is_superuser = models.BooleanField(default=False, verbose_name="Superuser (full access)")
+
+    # ── B2BI Group ─────────────────────────────────────────────────────────────
+    b2bi_groups = models.ManyToManyField(
+        B2BIGroup,
+        blank=True,
+        related_name="users",
+        verbose_name="B2BI Groups",
+    )
+
+    # ── Fix reverse accessor clash with auth.User ──────────────────────────────
+    groups = models.ManyToManyField(
+        "auth.Group",
+        blank=True,
+        related_name="b2bi_user_set",
+        related_query_name="b2bi_user",
+        verbose_name="groups",
+    )
+    user_permissions = models.ManyToManyField(
+        "auth.Permission",
+        blank=True,
+        related_name="b2bi_user_set",
+        related_query_name="b2bi_user",
+        verbose_name="user permissions",
+    )
+
+    # ── Timestamps ─────────────────────────────────────────────────────────────
+    date_joined = models.DateTimeField(auto_now_add=True)
+    updated_at  = models.DateTimeField(auto_now=True)
+
+    # ── Auth Config ────────────────────────────────────────────────────────────
+    USERNAME_FIELD  = "username"       # ← login with username now
+    REQUIRED_FIELDS = []
+
+    objects = B2BIUserManager()
+
+    def get_full_name(self):
+        return f"{self.first_name} {self.last_name}".strip() or self.username
+
+    def get_short_name(self):
+        return self.first_name or self.username
+
+    def __str__(self):
+        return self.username
+
+    class Meta:
+        app_label           = "b2bi"
+        db_table            = "b2bi_auth_user"
+        verbose_name        = "B2BI User"
+        verbose_name_plural = "B2BI Users"
+        ordering            = ["-date_joined"]
