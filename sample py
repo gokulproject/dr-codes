@@ -625,3 +625,13 @@ cols = [col.name for col in connection.introspection.get_table_description(conne
 print(cols)
 # Should show: ['id', 'password', 'last_login', 'username', 'first_name', ...]
 # Must NOT show 'email'
+
+
+from b2bi.models import B2BIUser
+
+B2BIUser.objects.create_superuser(
+    username = "b2bi_admin",
+    password = "admin@12345"
+)
+print("Done:", B2BIUser.objects.get(username="b2bi_admin").is_staff)
+# Output: Done: True
