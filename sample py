@@ -607,3 +607,14 @@ class B2BIUser(AbstractBaseUser, PermissionsMixin):
         verbose_name        = "B2BI User"
         verbose_name_plural = "B2BI Users"
         ordering            = ["-date_joined"]
+
+
+
+
+
+from b2bi.models import B2BIUser
+
+B2BIUser.objects.create_superuser(
+    username = "b2bi_admin",
+    password = "admin@12345"
+)
