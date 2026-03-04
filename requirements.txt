@@ -197,3 +197,69 @@ class B2BiAdminSite(AdminSite):
 
 
 staff_admin_site = B2BiAdminSite(name="staff_admin")
+
+
+from django.contrib.admin import AdminSite
+from django.urls import path
+from django.http import JsonResponse
+import sys
+import platform
+import django
+
+
+class B2BiAdminSite(AdminSite):
+    site_header = "B2Bi Admin Portal"
+    site_title  = "B2Bi Staff"
+    index_title = "B2Bi Admin Portal"
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom = [
+            path(
+                'system-info/',
+                self.admin_view(self.system_info_view),  # ✅ use our own view
+                name='system_info',
+            ),
+        ]
+        return custom + urls
+
+    def system_info_view(self, request):
+        from django.conf import settings
+
+        data = {
+            # ── Python & OS ──────────────────────────────
+            "python_version"   : sys.version,
+            "platform"         : platform.system(),          # Windows/Linux/Mac
+            "platform_version" : platform.version(),
+            "machine"          : platform.machine(),
+
+            # ── Django ───────────────────────────────────
+            "django_version"   : django.__version__,
+            "debug"            : settings.DEBUG,
+            "allowed_hosts"    : settings.ALLOWED_HOSTS,
+            "time_zone"        : settings.TIME_ZONE,
+
+            # ── Database ─────────────────────────────────
+            "database_engine"  : settings.DATABASES['default']['ENGINE'],
+            "database_name"    : settings.DATABASES['default']['NAME'],
+
+            # ── Email ─────────────────────────────────────
+            "email_backend"    : settings.EMAIL_BACKEND,
+            "email_host"       : getattr(settings, 'EMAIL_HOST', 'Not set'),
+            "email_port"       : getattr(settings, 'EMAIL_PORT', 'Not set'),
+
+            # ── Installed Apps ────────────────────────────
+            "installed_apps"   : list(settings.INSTALLED_APPS),
+
+            # ── Packages ─────────────────────────────────
+            "packages": {
+                pkg.metadata['Name']: pkg.version
+                for pkg in __import__('importlib.metadata',
+                    fromlist=['packages']).packages_distributions().keys()
+                    .__class__()  # just use pip list approach below
+            }
+        }
+        return JsonResponse(data, json_dumps_params={'indent': 2})
+
+
+staff_admin_site = B2BiAdminSite(name="staff_admin")
