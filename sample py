@@ -618,3 +618,10 @@ B2BIUser.objects.create_superuser(
     username = "b2bi_admin",
     password = "admin@12345"
 )
+
+
+from django.db import connection
+cols = [col.name for col in connection.introspection.get_table_description(connection.cursor(), 'b2bi_auth_user')]
+print(cols)
+# Should show: ['id', 'password', 'last_login', 'username', 'first_name', ...]
+# Must NOT show 'email'
