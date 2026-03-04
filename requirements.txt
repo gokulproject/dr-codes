@@ -1,210 +1,8 @@
-{% load static %}
-{% load django_bootstrap5 %}
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Health Check Report - {{ status.Customer|default:"Loading..." }}</title>
-    {% bootstrap_css %}
-    {% bootstrap_javascript %}
-</head>
-<body>
-    <header>{% include "healthcheckapp/hc_navbar.html" %}</header>
-    
-    <!-- Main Container with proper spacing -->
-    <div class="container-fluid px-4 py-4">
-        <!-- Results Table Card -->
-        <div class="card shadow-sm">
-            <div class="card-header bg-light text-dark">
-                <div class="d-flex justify-content-between align-items-center">
-                    <h6 class="mb-0">
-                        Health Check Report For {{ status.Customer }} - {{ status.Environment }}
-                    </h6>
-                    <!-- Download button at right top of the table card -->
-                    <a href="{% url 'healthcheckapp:download_records_excel' %}?proc_id={{ process_id }}&fname=Health%20Check%20Report%20{{ status.Customer|urlencode }}%20{{ status.Environment|urlencode }}%20{{ status.StartTime|date:'Ymd_Hi' }}" 
-                       class="btn btn-sm btn-primary">
-                        Download
-                    </a>
-                </div>
-            </div>
-            <div class="card-body p-3">
-                <div class="table-responsive" style="max-height: 70vh;">
-                    <table class="table table-hover mb-0">
-                        <thead class="table-light sticky-top">
-                            <tr>
-                                <th style="width: 5%;">SI No</th>
-                                <th style="width: 40%;">Test Name</th>
-                                <th style="width: 30%;">Value</th>
-                                <th style="width: 10%;">Action Required</th>
-                                <th style="width: 15%;">Failure</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for test in tests %}
-                            <tr>
-                                <!-- Serial number -->
-                                <td>{{ forloop.counter }}</td>
-                                <td class="fw-semibold">
-                                    {{ test.testname }}
-                                    {% if test.test_id %}
-                                    {# <span class="badge bg-secondary ms-2">#{{ test.test_id }}</span> #}
-                                    {% endif %}
-                                </td>
-                                <td>{{ test.value }}</td>
-                                <td class="{% if 'no' in test.action|lower %}table-success{% elif 'yes' in test.action|lower %}table-danger{% else %}table-light fw-semibold{% endif %} text-center py-3">
-                                    {{ test.action|default:"-" }}
-                                </td>
-                                <td>
-                                    {{ test.failure|default:"-" }}
-                                </td>
-                            </tr>
-                            {% empty %}
-                            <tr>
-                                <td colspan="5" class="text-center py-5">
-                                    <h5 class="text-muted mb-3">No Test Results Available</h5>
-                                    <p class="text-muted">No health check data found for this process.</p>
-                                </td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            // Simple row hover effect
-            document.querySelectorAll('tbody tr').forEach(function(row) {
-                row.addEventListener('mouseenter', function() {
-                    this.style.backgroundColor = '#f8f9fa';
-                });
-                row.addEventListener('mouseleave', function() {
-                    this.style.backgroundColor = '';
-                });
-            });
-
-            // Download button feedback (table-level download button)
-            document.querySelectorAll('.btn-primary, .btn-success').forEach(function(btn) {
-                btn.addEventListener('click', function() {
-                    const original = this.innerHTML;
-                    this.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Downloading...';
-                    this.disabled = true;
-                    setTimeout(() => {
-                        this.innerHTML = original;
-                        this.disabled = false;
-                    }, 1000);
-                });
-            });
-        });
-    </script>
-</body>
-</html>
-
-from django.contrib import admin
-from django.contrib.auth.models import User, Group
-from django.contrib.auth.admin import UserAdmin, GroupAdmin
-
-class StaffAdminSite(admin.AdminSite):
-    site_header = "Admin Portal"
-
-    def has_permission(self, request):
-        return request.user.is_active and request.user.is_staff
-
-staff_admin_site = StaffAdminSite(name='staff_admin')
-
-staff_admin_site.register(User, UserAdmin)
-staff_admin_site.register(Group, GroupAdmin)
-
-
-
-
-from django.contrib import admin
-from django.contrib.auth.models import User, Group
-from django.contrib.auth.admin import UserAdmin, GroupAdmin
-
-
-class StaffAdminSite(admin.AdminSite):
-    site_header = "Admin Portal"
-
-    def has_permission(self, request):
-        return request.user.is_active and request.user.is_staff
-
-
-# IMPORTANT → use underscore
-staff_admin_site = StaffAdminSite(name='admin_portal')
-
-
-# 🔥 Register with proper Admin classes
-staff_admin_site.register(User, UserAdmin)
-staff_admin_site.register(Group, GroupAdmin)
-
-
-
-
-
-from django.contrib import admin
-from django.contrib.admin import AdminSite
-from .models import YourModel
-
-
-# 🔐 Restrict default admin to superusers only
-def superuser_only(self, request):
-    return request.user.is_active and request.user.is_superuser
-
-admin.site.has_permission = superuser_only
-
-
-# 🧑‍💼 Custom Staff Admin
-class StaffAdminSite(AdminSite):
-    site_header = "Admin Portal"
-    site_title = "Staff Panel"
-    index_title = "Welcome Staff"
-
-    def has_permission(self, request):
-        return request.user.is_active and request.user.is_staff and not request.user.is_superuser
-
-
-staff_admin_site = StaffAdminSite(name="admin_portal")
-
-staff_admin_site.register(YourModel)
-
-
-
-
-from django.contrib.admin import AdminSite
-from django.urls import path
-
-
-class B2BiAdminSite(AdminSite):
-    site_header = "B2Bi Admin Portal"
-    site_title  = "B2Bi Staff"
-    index_title = "B2Bi Admin Portal"
-
-    def get_urls(self):
-        from django_sysinfo.views import sysinfo
-        urls = super().get_urls()
-        custom = [
-            path(
-                'system-info/',
-                self.admin_view(sysinfo),
-                name='system_info',
-            ),
-        ]
-        return custom + urls
-
-
-staff_admin_site = B2BiAdminSite(name="staff_admin")
-
-
 from django.contrib.admin import AdminSite
 from django.urls import path
 from django.http import JsonResponse
-import sys
-import platform
-import django
+from django.conf import settings
+import sys, platform, django
 
 
 class B2BiAdminSite(AdminSite):
@@ -217,47 +15,25 @@ class B2BiAdminSite(AdminSite):
         custom = [
             path(
                 'system-info/',
-                self.admin_view(self.system_info_view),  # ✅ use our own view
+                self.admin_view(self.system_info_view),
                 name='system_info',
             ),
         ]
         return custom + urls
 
     def system_info_view(self, request):
-        from django.conf import settings
-
         data = {
-            # ── Python & OS ──────────────────────────────
-            "python_version"   : sys.version,
-            "platform"         : platform.system(),          # Windows/Linux/Mac
-            "platform_version" : platform.version(),
-            "machine"          : platform.machine(),
-
-            # ── Django ───────────────────────────────────
-            "django_version"   : django.__version__,
-            "debug"            : settings.DEBUG,
-            "allowed_hosts"    : settings.ALLOWED_HOSTS,
-            "time_zone"        : settings.TIME_ZONE,
-
-            # ── Database ─────────────────────────────────
-            "database_engine"  : settings.DATABASES['default']['ENGINE'],
-            "database_name"    : settings.DATABASES['default']['NAME'],
-
-            # ── Email ─────────────────────────────────────
-            "email_backend"    : settings.EMAIL_BACKEND,
-            "email_host"       : getattr(settings, 'EMAIL_HOST', 'Not set'),
-            "email_port"       : getattr(settings, 'EMAIL_PORT', 'Not set'),
-
-            # ── Installed Apps ────────────────────────────
-            "installed_apps"   : list(settings.INSTALLED_APPS),
-
-            # ── Packages ─────────────────────────────────
-            "packages": {
-                pkg.metadata['Name']: pkg.version
-                for pkg in __import__('importlib.metadata',
-                    fromlist=['packages']).packages_distributions().keys()
-                    .__class__()  # just use pip list approach below
-            }
+            "python"         : sys.version,
+            "platform"       : platform.platform(),
+            "django"         : django.__version__,
+            "debug"          : settings.DEBUG,
+            "database"       : settings.DATABASES['default']['ENGINE'],
+            "database_name"  : str(settings.DATABASES['default']['NAME']),
+            "time_zone"      : settings.TIME_ZONE,
+            "installed_apps" : list(settings.INSTALLED_APPS),
+            "email_host"     : getattr(settings, 'EMAIL_HOST', 'Not set'),
+            "email_port"     : getattr(settings, 'EMAIL_PORT', 'Not set'),
+            "allowed_hosts"  : settings.ALLOWED_HOSTS,
         }
         return JsonResponse(data, json_dumps_params={'indent': 2})
 
