@@ -682,6 +682,17 @@ auth.User (superuser)      → /admin/      ✅   /b2bi-admin/ ❌
 ```
 
 
+python manage.py shell
+from b2bi.models import B2BIUser
+
+B2BIUser.objects.create_superuser(
+    email    = "admin@b2bi.com",
+    password = "securepassword123"
+)
+
+
+
+
 
 
 
