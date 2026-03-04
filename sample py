@@ -645,3 +645,41 @@ with connection.cursor() as cursor:
     columns = cursor.fetchall()
     for col in columns:
         print(f"Column: {col[1]}  |  Type: {col[2]}  |  Nullable: {col[3]}")
+
+
+
+
+____________________
+
+
+Fix
+Step 1 — Run migrate to sync everything
+python manage.py migrate
+Step 2 — Rebuild content types
+python manage.py shell
+from django.contrib.contenttypes.management import create_contenttypes
+from django.apps import apps
+
+# Rebuild content types for b2bi app
+app_config = apps.get_app_config('b2bi')
+create_contenttypes(app_config, verbosity=2)
+print("Content types rebuilt.")
+Step 3 — Create permissions
+from django.contrib.auth.management import create_permissions
+from django.apps import apps
+
+app_config = apps.get_app_config('b2bi')
+create_permissions(app_config, verbosity=2)
+print("Permissions created.")
+Step 4 — Verify content types exist
+from django.contrib.contenttypes.models import ContentType
+
+cts = ContentType.objects.filter(app_label='b2bi')
+for ct in cts:
+    print(ct.app_label, ct.model)
+
+# Expected output:
+# b2bi b2biuser
+# b2bi b2bigroup
+Step 5 — Try adding group again
+Go to http://localhost:8000/b2bi-admin/b2bi/b2bigroup/add/ and add a group. ✅
