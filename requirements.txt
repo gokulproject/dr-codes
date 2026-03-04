@@ -170,3 +170,30 @@ class StaffAdminSite(AdminSite):
 staff_admin_site = StaffAdminSite(name="admin_portal")
 
 staff_admin_site.register(YourModel)
+
+
+
+
+from django.contrib.admin import AdminSite
+from django.urls import path
+
+
+class B2BiAdminSite(AdminSite):
+    site_header = "B2Bi Admin Portal"
+    site_title  = "B2Bi Staff"
+    index_title = "B2Bi Admin Portal"
+
+    def get_urls(self):
+        from django_sysinfo.views import sysinfo
+        urls = super().get_urls()
+        custom = [
+            path(
+                'system-info/',
+                self.admin_view(sysinfo),
+                name='system_info',
+            ),
+        ]
+        return custom + urls
+
+
+staff_admin_site = B2BiAdminSite(name="staff_admin")
