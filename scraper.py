@@ -673,3 +673,229 @@
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
+
+
+
+
+__________++++++++_________
+from django.shortcuts import render
+from django.contrib.auth.decorators import login_required, user_passes_test
+from django.contrib.auth import get_user_model
+from django.db.models import Q
+from django.core.paginator import Paginator
+from easyaudit.models import CRUDEvent, RequestEvent, LoginEvent
+from django.apps import apps
+import datetime
+
+User = get_user_model()
+
+
+def is_staff(user):
+    return user.is_staff or user.is_superuser
+
+
+@login_required
+@user_passes_test(is_staff)
+def audit_log(request):
+    # ── Grab filter params ──────────────────────────────────────────────────
+    event_type   = request.GET.get('event_type', '')      # crud / request / login
+    app_label    = request.GET.get('app_label', '')
+    model_name   = request.GET.get('model_name', '')
+    user_id      = request.GET.get('user_id', '')
+    date_from    = request.GET.get('date_from', '')
+    date_to      = request.GET.get('date_to', '')
+    search       = request.GET.get('search', '')
+    crud_action  = request.GET.get('crud_action', '')     # CREATE / UPDATE / DELETE / READ
+    login_type   = request.GET.get('login_type', '')      # L / LO / F
+    per_page     = request.GET.get('per_page', '25')
+
+    # ── Build base querysets ────────────────────────────────────────────────
+    crud_qs    = CRUDEvent.objects.select_related('user').order_by('-datetime')
+    request_qs = RequestEvent.objects.select_related('user').order_by('-datetime')
+    login_qs   = LoginEvent.objects.select_related('user').order_by('-datetime')
+
+    # ── App label / model filters (apply to CRUD only) ──────────────────────
+    if app_label:
+        crud_qs = crud_qs.filter(content_type__app_label=app_label)
+    if model_name:
+        crud_qs = crud_qs.filter(content_type__model=model_name.lower())
+
+    # ── CRUD action filter ───────────────────────────────────────────────────
+    CRUD_MAP = {
+        'CREATE': CRUDEvent.CREATE,
+        'READ':   CRUDEvent.READ,
+        'UPDATE': CRUDEvent.UPDATE,
+        'DELETE': CRUDEvent.DELETE,
+    }
+    if crud_action and crud_action in CRUD_MAP:
+        crud_qs = crud_qs.filter(event_type=CRUD_MAP[crud_action])
+
+    # ── Login type filter ────────────────────────────────────────────────────
+    LOGIN_MAP = {
+        'L':  LoginEvent.LOGIN,
+        'LO': LoginEvent.LOGOUT,
+        'F':  LoginEvent.LOGIN_FAILED,
+    }
+    if login_type and login_type in LOGIN_MAP:
+        login_qs = login_qs.filter(login_type=LOGIN_MAP[login_type])
+
+    # ── User filter ──────────────────────────────────────────────────────────
+    if user_id:
+        crud_qs    = crud_qs.filter(user_id=user_id)
+        request_qs = request_qs.filter(user_id=user_id)
+        login_qs   = login_qs.filter(user_id=user_id)
+
+    # ── Date range filter ────────────────────────────────────────────────────
+    if date_from:
+        try:
+            df = datetime.datetime.strptime(date_from, '%Y-%m-%d')
+            crud_qs    = crud_qs.filter(datetime__gte=df)
+            request_qs = request_qs.filter(datetime__gte=df)
+            login_qs   = login_qs.filter(datetime__gte=df)
+        except ValueError:
+            pass
+
+    if date_to:
+        try:
+            dt = datetime.datetime.strptime(date_to, '%Y-%m-%d') + datetime.timedelta(days=1)
+            crud_qs    = crud_qs.filter(datetime__lt=dt)
+            request_qs = request_qs.filter(datetime__lt=dt)
+            login_qs   = login_qs.filter(datetime__lt=dt)
+        except ValueError:
+            pass
+
+    # ── Search filter ────────────────────────────────────────────────────────
+    if search:
+        crud_qs = crud_qs.filter(
+            Q(object_repr__icontains=search) |
+            Q(user__username__icontains=search) |
+            Q(content_type__model__icontains=search)
+        )
+        request_qs = request_qs.filter(
+            Q(url__icontains=search) |
+            Q(user__username__icontains=search)
+        )
+        login_qs = login_qs.filter(
+            Q(user__username__icontains=search) |
+            Q(remote_ip__icontains=search)
+        )
+
+    # ── Select active tab / queryset ─────────────────────────────────────────
+    if event_type == 'request':
+        active_qs   = request_qs
+        active_tab  = 'request'
+    elif event_type == 'login':
+        active_qs   = login_qs
+        active_tab  = 'login'
+    else:
+        active_qs   = crud_qs
+        active_tab  = 'crud'
+
+    # ── Pagination ───────────────────────────────────────────────────────────
+    try:
+        per_page_int = int(per_page)
+        if per_page_int not in [10, 25, 50, 100]:
+            per_page_int = 25
+    except ValueError:
+        per_page_int = 25
+
+    paginator = Paginator(active_qs, per_page_int)
+    page_number = request.GET.get('page', 1)
+    page_obj = paginator.get_page(page_number)
+
+    # ── Sidebar counts (unfiltered) ───────────────────────────────────────────
+    total_crud    = CRUDEvent.objects.count()
+    total_request = RequestEvent.objects.count()
+    total_login   = LoginEvent.objects.count()
+
+    # ── Dropdown data ─────────────────────────────────────────────────────────
+    all_users = User.objects.filter(is_active=True).order_by('username')
+
+    # Installed app labels that have at least one CRUD event
+    app_labels = (
+        CRUDEvent.objects
+        .values_list('content_type__app_label', flat=True)
+        .distinct()
+        .order_by('content_type__app_label')
+    )
+
+    # Models for selected app
+    model_names = []
+    if app_label:
+        model_names = (
+            CRUDEvent.objects
+            .filter(content_type__app_label=app_label)
+            .values_list('content_type__model', flat=True)
+            .distinct()
+            .order_by('content_type__model')
+        )
+
+    context = {
+        # pagination
+        'page_obj':      page_obj,
+        'paginator':     paginator,
+        'per_page':      per_page_int,
+
+        # active state
+        'active_tab':    active_tab,
+        'event_type':    event_type,
+
+        # filter values (so form stays filled)
+        'filter_app_label':   app_label,
+        'filter_model_name':  model_name,
+        'filter_user_id':     user_id,
+        'filter_date_from':   date_from,
+        'filter_date_to':     date_to,
+        'filter_search':      search,
+        'filter_crud_action': crud_action,
+        'filter_login_type':  login_type,
+
+        # dropdown data
+        'all_users':   all_users,
+        'app_labels':  app_labels,
+        'model_names': model_names,
+
+        # summary counts
+        'total_crud':    total_crud,
+        'total_request': total_request,
+        'total_login':   total_login,
+
+        # event type constants for template
+        'CRUD_CREATE': CRUDEvent.CREATE,
+        'CRUD_READ':   CRUDEvent.READ,
+        'CRUD_UPDATE': CRUDEvent.UPDATE,
+        'CRUD_DELETE': CRUDEvent.DELETE,
+        'LOGIN_IN':     LoginEvent.LOGIN,
+        'LOGIN_OUT':    LoginEvent.LOGOUT,
+        'LOGIN_FAILED': LoginEvent.LOGIN_FAILED,
+    }
+
+    return render(request, 'accounts/audit_log.html', context)
+
+
+
+_____&&&_______
+
+
+
+from django.urls import path
+from . import views
+
+app_name = 'accounts'
+
+urlpatterns = [
+    # ── Audit Log ──────────────────────────────────────────────────
+    path('audit-log/', views.audit_log, name='audit_log'),
+
+    # Add your other accounts URLs here …
+    # path('login/',  views.login_view,  name='login'),
+    # path('logout/', views.logout_view, name='logout'),
+]
+
+_______
+⑤ Icon-only button (good for tight toolbars) -->
+<a href="{% url 'accounts:audit_log' %}"
+   class="btn btn-sm btn-light border"
+   data-bs-toggle="tooltip" title="Audit Log">
+  <i class="bi bi-journal-check"></i>
+</a>
