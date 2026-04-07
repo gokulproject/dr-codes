@@ -1,274 +1,310 @@
-"""
-Main Entry Point - Drug Intelligence Automation
-Orchestrates the complete end-to-end workflow
-Execute: python main.py
-"""
+document.addEventListener('DOMContentLoaded', function () {
 
-import sys
-import os
-from datetime import datetime
-import time
+  // ── Inject Bootstrap Modal HTML ─────────────────────────────────────────
+  const modalHtml = `
+  <div class="modal fade" id="auditDetailModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+      <div class="modal-content">
+        <div class="modal-header bg-dark text-white">
+          <h5 class="modal-title">
+            <i class="bi bi-journal-text me-2"></i> Activity Log Details
+          </h5>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body p-0" id="auditModalBody">
+          <div class="text-center p-5">
+            <div class="spinner-border text-primary" role="status"></div>
+            <p class="mt-2 text-muted">Loading details...</p>
+          </div>
+        </div>
+        <div class="modal-footer bg-light">
+          <small class="text-muted me-auto">
+            <i class="bi bi-info-circle me-1"></i>
+            This log is read-only. Contact your administrator if you have questions.
+          </small>
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+  document.body.insertAdjacentHTML('beforeend', modalHtml);
 
-# Import all modules
-from config import config
-from database import DatabaseManager
-from logger import create_logger
-from email_sender import EmailSender
-from excel_manager import ExcelManager
-from processors import DrugDataProcessor
-from drug_intelligence import DrugIntelligenceWorkflow
+  const modalEl   = document.getElementById('auditDetailModal');
+  const modalBody = document.getElementById('auditModalBody');
+  const bsModal   = new bootstrap.Modal(modalEl);
 
+  // ── Helpers ─────────────────────────────────────────────────────────────
 
-def print_banner(logger):
-    """Print application banner"""
-    banner = """
-╔════════════════════════════════════════════════════════════════╗
-║                                                                ║
-║          DRUG INTELLIGENCE AUTOMATION SYSTEM                   ║
-║                                                                ║
-║          Converting RPA to Production Python                   ║
-║                                                                ║
-╚════════════════════════════════════════════════════════════════╝
-    """
-    print(banner)
-    if logger:
-        logger.info(banner)
+  function prettifyKey(key) {
+    return key
+      .replace(/_id$/, '')
+      .replace(/_/g, ' ')
+      .replace(/\b\w/g, c => c.toUpperCase());
+  }
 
+  function actionBadge(action) {
+    const map = {
+      'Create' : ['bg-success', 'bi-plus-circle-fill',  'Created'],
+      'Update' : ['bg-warning text-dark', 'bi-pencil-fill', 'Updated'],
+      'Delete' : ['bg-danger',  'bi-trash-fill',        'Deleted'],
+      'Access' : ['bg-info',    'bi-eye-fill',          'Viewed'],
+    };
+    for (const [key, [cls, icon, label]] of Object.entries(map)) {
+      if (action.toLowerCase().includes(key.toLowerCase())) {
+        return `<span class="badge ${cls} fs-6 px-3 py-2">
+                  <i class="bi ${icon} me-1"></i>${label}
+                </span>`;
+      }
+    }
+    return `<span class="badge bg-secondary fs-6 px-3 py-2">${action}</span>`;
+  }
 
-def print_summary(logger, summary_data: dict):
-    """Print execution summary"""
-    print("\n" + "="*70)
-    print("EXECUTION SUMMARY".center(70))
-    print("="*70)
-    
-    for key, value in summary_data.items():
-        print(f"{key:.<50} {value}")
-    
-    print("="*70 + "\n")
-    
-    if logger:
-        logger.log_summary(summary_data)
+  function formatValue(value) {
+    if (value === null || value === undefined || value === '')
+      return `<span class="text-muted fst-italic">Not set</span>`;
+    if (typeof value === 'boolean')
+      return value
+        ? `<span class="badge bg-success">Yes</span>`
+        : `<span class="badge bg-secondary">No</span>`;
+    if (typeof value === 'string' && value.match(/^\d{4}-\d{2}-\d{2}/))
+      return `<i class="bi bi-calendar2 me-1 text-muted"></i>${value}`;
+    return `<span>${value}</span>`;
+  }
 
+  // Resolve FK id → human name via Django admin
+  async function resolveId(app, model, id) {
+    try {
+      const res = await fetch(`/admin/${app}/${model}/${id}/change/`, {
+        credentials: 'same-origin'
+      });
+      if (!res.ok) return null;
+      const html = await res.text();
+      const doc  = new DOMParser().parseFromString(html, 'text/html');
+      const h1   = doc.querySelector('#content h1');
+      if (h1) return h1.textContent.replace(/^Change\s+/i, '').trim();
+    } catch (_) {}
+    return null;
+  }
 
-def main():
-    """
-    Main execution function
-    """
-    logger = None
-    db_manager = None
-    start_time = time.time()
-    
-    try:
-        # =====================================================================
-        # STEP 1: INITIALIZE LOGGER
-        # =====================================================================
-        print("\n⏳ Initializing logger...")
-        
-        logger = create_logger(log_dir="./logs")
-        print_banner(logger)
-        
-        logger.success("✅ Logger initialized successfully")
-        
-        # =====================================================================
-        # STEP 2: INITIALIZE DATABASE CONNECTION
-        # =====================================================================
-        logger.log_process_step("Database Connection", "STARTED")
-        
-        db_manager = DatabaseManager(config.DB_CONFIG, logger)
-        
-        if not db_manager.connect():
-            raise Exception("Failed to connect to database")
-        
-        logger.log_process_step("Database Connection", "COMPLETED")
-        
-        # =====================================================================
-        # STEP 3: LOAD CONFIGURATIONS FROM DATABASE
-        # =====================================================================
-        logger.log_process_step("Configuration Loading", "STARTED")
-        
-        if not config.initialize_all_configs(db_manager):
-            raise Exception("Failed to load configurations from database")
-        
-        logger.info(f"✅ Loaded {len(config.table_names)} table configurations")
-        logger.info(f"✅ Loaded {len(config.paths)} path configurations")
-        logger.info(f"✅ Loaded {len(config.excluded_saltnames)} excluded salt names")
-        
-        logger.log_process_step("Configuration Loading", "COMPLETED")
-        
-        # =====================================================================
-        # STEP 4: INITIALIZE EMAIL SENDER
-        # =====================================================================
-        logger.log_process_step("Email Sender Initialization", "STARTED")
-        
-        email_sender = EmailSender(config.EMAIL_CONFIG, logger)
-        
-        # Test SMTP connection (optional)
-        # email_sender.test_connection()
-        
-        logger.log_process_step("Email Sender Initialization", "COMPLETED")
-        
-        # =====================================================================
-        # STEP 5: INITIALIZE EXCEL MANAGER
-        # =====================================================================
-        logger.log_process_step("Excel Manager Initialization", "STARTED")
-        
-        excel_manager = ExcelManager(
-            excel_handler_path="./ExcelHandler",
-            logger=logger
-        )
-        
-        logger.log_process_step("Excel Manager Initialization", "COMPLETED")
-        
-        # =====================================================================
-        # STEP 6: INITIALIZE DATA PROCESSOR
-        # =====================================================================
-        logger.log_process_step("Data Processor Initialization", "STARTED")
-        
-        processor = DrugDataProcessor(
-            data_processing_path="./DataProcessing",
-            config=config,
-            db_manager=db_manager,
-            excel_manager=excel_manager,
-            logger=logger
-        )
-        
-        logger.log_process_step("Data Processor Initialization", "COMPLETED")
-        
-        # =====================================================================
-        # STEP 7: INITIALIZE WORKFLOW ORCHESTRATOR
-        # =====================================================================
-        logger.log_process_step("Workflow Initialization", "STARTED")
-        
-        workflow = DrugIntelligenceWorkflow(
-            config=config,
-            db_manager=db_manager,
-            excel_manager=excel_manager,
-            processor=processor,
-            email_sender=email_sender,
-            logger=logger
-        )
-        
-        logger.log_process_step("Workflow Initialization", "COMPLETED")
-        
-        # =====================================================================
-        # STEP 8: INITIALIZE PROCESS
-        # =====================================================================
-        if not workflow.initialize_process():
-            raise Exception("Process initialization failed")
-        
-        # =====================================================================
-        # STEP 9: MASTER TRACKER UPDATE (PROCESS ALL CUSTOMERS)
-        # =====================================================================
-        if not workflow.master_tracker_update():
-            logger.warning("⚠️ Master tracker update completed with warnings")
-        
-        # =====================================================================
-        # STEP 10: GENERATE REPORTS
-        # =====================================================================
-        if not workflow.generate_report():
-            raise Exception("Report generation failed")
-        
-        # =====================================================================
-        # STEP 11: MOVE TO OUTPUT AND SEND NOTIFICATIONS
-        # =====================================================================
-        if not workflow.move_to_bot_out():
-            raise Exception("Failed to move output files")
-        
-        # =====================================================================
-        # STEP 12: MARK PROCESS AS COMPLETED
-        # =====================================================================
-        workflow.complete_process()
-        
-        # =====================================================================
-        # STEP 13: PRINT SUMMARY
-        # =====================================================================
-        end_time = time.time()
-        execution_time = end_time - start_time
-        
-        summary_data = {
-            "Process ID": config.process_id,
-            "Master Tracker File": config.master_tracker_filename,
-            "Total Customers": workflow.total_customers,
-            "Successfully Processed": workflow.processed_customers,
-            "Failed": workflow.failed_customers,
-            "Execution Time": f"{execution_time:.2f} seconds",
-            "Status": "✅ COMPLETED SUCCESSFULLY"
+  // Resolve an entire snapshot fields object — returns { key: displayValue }
+  async function resolveSnapshotFields(app, fields) {
+    const entries = await Promise.all(
+      Object.entries(fields).map(async ([key, value]) => {
+        if (key.endsWith('_id') && value !== null && value !== '') {
+          const modelName = key.replace(/_id$/, '');
+          const name = await resolveId(app, modelName, value);
+          return [key, name ?? value, true];   // [key, resolvedDisplay, isFk]
         }
-        
-        print_summary(logger, summary_data)
-        
-        logger.success("="*70)
-        logger.success("DRUG INTELLIGENCE AUTOMATION COMPLETED SUCCESSFULLY")
-        logger.success("="*70)
-        
-        return 0
-        
-    except KeyboardInterrupt:
-        if logger:
-            logger.warning("⚠️ Process interrupted by user")
-        print("\n⚠️ Process interrupted by user")
-        return 1
-        
-    except Exception as e:
-        error_msg = f"CRITICAL ERROR: {str(e)}"
-        
-        if logger:
-            logger.critical("="*70)
-            logger.critical("PROCESS FAILED")
-            logger.critical("="*70)
-            logger.error(f"❌ {error_msg}")
-            logger.log_exception("main", e)
-        
-        print(f"\n❌ {error_msg}")
-        
-        # Calculate execution time
-        end_time = time.time()
-        execution_time = end_time - start_time
-        
-        # Print failure summary
-        summary_data = {
-            "Status": "❌ FAILED",
-            "Error": str(e),
-            "Execution Time": f"{execution_time:.2f} seconds"
+        return [key, value, false];
+      })
+    );
+    return entries;
+  }
+
+  // Build snapshot table rows (awaited)
+  async function buildSnapshotRows(app, snapshotJson) {
+    let data;
+    try { data = JSON.parse(snapshotJson); } catch { return null; }
+    const fields = Array.isArray(data) ? (data[0]?.fields ?? {}) : data;
+    const entries = await resolveSnapshotFields(app, fields);
+
+    return entries.map(([key, value, isFk]) => {
+      const label   = prettifyKey(key);
+      const display = isFk
+        ? (value
+            ? `<span class="text-success fw-semibold">${value}</span>`
+            : `<span class="text-muted fst-italic">Not set</span>`)
+        : formatValue(value);
+
+      return `
+        <tr>
+          <td class="fw-semibold text-secondary ps-3" style="width:35%;">
+            <i class="bi bi-dot me-1"></i>${label}
+          </td>
+          <td class="pe-3">${display}</td>
+        </tr>`;
+    }).join('');
+  }
+
+  // Build changed-fields rows
+  async function buildChangedRows(app, changesJson) {
+    let ch;
+    try { ch = JSON.parse(changesJson); } catch { return ''; }
+    if (!ch || !Object.keys(ch).length) return '';
+
+    const rows = await Promise.all(
+      Object.entries(ch).map(async ([key, value]) => {
+        const label = prettifyKey(key);
+        let before  = Array.isArray(value) ? value[0] : '—';
+        let after   = Array.isArray(value) ? value[1] : value;
+
+        // Resolve FK values
+        if (key.endsWith('_id')) {
+          const model = key.replace(/_id$/, '');
+          if (before && before !== '—') {
+            const n = await resolveId(app, model, before);
+            if (n) before = n;
+          }
+          if (after && after !== '—') {
+            const n = await resolveId(app, model, after);
+            if (n) after = n;
+          }
         }
-        
-        if config.process_id:
-            summary_data["Process ID"] = config.process_id
-        
-        print_summary(logger, summary_data)
-        
-        return 1
-        
-    finally:
-        # =====================================================================
-        # CLEANUP: CLOSE DATABASE CONNECTION
-        # =====================================================================
-        if db_manager:
-            try:
-                db_manager.disconnect()
-                if logger:
-                    logger.info("✅ Database connection closed")
-            except Exception as e:
-                if logger:
-                    logger.warning(f"⚠️ Error closing database: {str(e)}")
-        
-        # Close logger
-        if logger:
-            logger.close()
-        
-        print("\n" + "="*70)
-        print("Thank you for using Drug Intelligence Automation System")
-        print("="*70 + "\n")
 
+        const beforeHtml = (before === null || before === '' || before === '—')
+          ? `<span class="text-muted fst-italic">Not set</span>`
+          : `<span class="text-danger">${before}</span>`;
 
-if __name__ == "__main__":
-    """
-    Entry point for command-line execution
-    Usage: python main.py
-    """
-    try:
-        exit_code = main()
-        sys.exit(exit_code)
-    except Exception as e:
-        print(f"\n❌ Fatal error: {str(e)}")
-        sys.exit(1)
+        const afterHtml = (after === null || after === '' || after === '—')
+          ? `<span class="text-muted fst-italic">Not set</span>`
+          : `<span class="text-success fw-semibold">${after}</span>`;
+
+        return `
+          <tr>
+            <td class="fw-semibold ps-3" style="width:30%;">
+              <i class="bi bi-arrow-right-circle me-1 text-primary"></i>${label}
+            </td>
+            <td class="text-center">${beforeHtml}</td>
+            <td class="text-center">${afterHtml}</td>
+          </tr>`;
+      })
+    );
+    return rows.join('');
+  }
+
+  // ── Button click ─────────────────────────────────────────────────────────
+  document.querySelectorAll('.view-audit-btn').forEach(btn => {
+    btn.addEventListener('click', async function () {
+      const datetime = this.dataset.datetime || '—';
+      const action   = this.dataset.action   || '—';
+      const app      = this.dataset.app      || '';
+      const model    = this.dataset.model    || '—';
+      const object   = this.dataset.object   || '—';
+      const user     = this.dataset.user     || 'System';
+      const changes  = this.dataset.changes  || '{}';
+      const snapshot = this.dataset.snapshot || '{}';
+
+      const modelLabel = model.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+      // Show modal with spinner
+      modalBody.innerHTML = `
+        <div class="text-center p-5">
+          <div class="spinner-border text-primary" role="status"></div>
+          <p class="mt-3 text-muted">Resolving record names, please wait…</p>
+        </div>`;
+      bsModal.show();
+
+      // Fetch all resolved data in parallel
+      const [changedRows, snapshotRows] = await Promise.all([
+        buildChangedRows(app, changes),
+        buildSnapshotRows(app, snapshot),
+      ]);
+
+      // ── Compose full modal body ───────────────────────────────────────
+      modalBody.innerHTML = `
+
+        <!-- ① WHAT HAPPENED banner -->
+        <div class="p-4 border-bottom bg-light d-flex flex-wrap align-items-center gap-3">
+          <div>${actionBadge(action)}</div>
+          <div>
+            <div class="fw-bold fs-5">${object}</div>
+            <div class="text-muted small">
+              <i class="bi bi-table me-1"></i>${modelLabel} &nbsp;|&nbsp;
+              <i class="bi bi-person me-1"></i>${user} &nbsp;|&nbsp;
+              <i class="bi bi-clock me-1"></i>${datetime}
+            </div>
+          </div>
+        </div>
+
+        <div class="p-4">
+
+          <!-- ② SUMMARY CARDS -->
+          <div class="row g-3 mb-4">
+            <div class="col-sm-6 col-md-3">
+              <div class="card border-0 bg-primary bg-opacity-10 h-100">
+                <div class="card-body py-3">
+                  <div class="text-primary small fw-semibold text-uppercase">Action</div>
+                  <div class="fw-bold">${action}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6 col-md-3">
+              <div class="card border-0 bg-success bg-opacity-10 h-100">
+                <div class="card-body py-3">
+                  <div class="text-success small fw-semibold text-uppercase">Record</div>
+                  <div class="fw-bold">${object}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6 col-md-3">
+              <div class="card border-0 bg-warning bg-opacity-10 h-100">
+                <div class="card-body py-3">
+                  <div class="text-warning small fw-semibold text-uppercase">Done By</div>
+                  <div class="fw-bold">${user}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6 col-md-3">
+              <div class="card border-0 bg-info bg-opacity-10 h-100">
+                <div class="card-body py-3">
+                  <div class="text-info small fw-semibold text-uppercase">Module</div>
+                  <div class="fw-bold">${modelLabel}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ③ WHAT CHANGED (only on Update) -->
+          ${changedRows ? `
+          <div class="card mb-4 border-warning">
+            <div class="card-header bg-warning bg-opacity-10 fw-bold text-warning-emphasis">
+              <i class="bi bi-pencil-square me-2"></i>What Was Changed
+            </div>
+            <div class="card-body p-0">
+              <div class="table-responsive">
+                <table class="table table-sm table-hover align-middle mb-0">
+                  <thead class="table-light">
+                    <tr>
+                      <th class="ps-3">Field</th>
+                      <th class="text-center">Previous Value</th>
+                      <th class="text-center">New Value</th>
+                    </tr>
+                  </thead>
+                  <tbody>${changedRows}</tbody>
+                </table>
+              </div>
+            </div>
+          </div>` : `
+          <div class="alert alert-light border mb-4">
+            <i class="bi bi-info-circle me-2 text-muted"></i>
+            <span class="text-muted">No individual field changes recorded for this action.</span>
+          </div>`}
+
+          <!-- ④ FULL RECORD SNAPSHOT -->
+          ${snapshotRows ? `
+          <div class="card border-secondary border-opacity-25">
+            <div class="card-header bg-secondary bg-opacity-10 fw-bold text-secondary">
+              <i class="bi bi-card-list me-2"></i>Full Record Details
+              <small class="fw-normal ms-2 text-muted">— All field values at the time of this action</small>
+            </div>
+            <div class="card-body p-0">
+              <div class="table-responsive">
+                <table class="table table-sm table-striped table-hover align-middle mb-0">
+                  <thead class="table-dark">
+                    <tr>
+                      <th class="ps-3">Field Name</th>
+                      <th>Value</th>
+                    </tr>
+                  </thead>
+                  <tbody>${snapshotRows}</tbody>
+                </table>
+              </div>
+            </div>
+          </div>` : ''}
+
+        </div><!-- /p-4 -->
+      `;
+    });
+  });
+
+});
