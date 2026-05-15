@@ -100,3 +100,27 @@ def send_resolved(self, run_id: int, customer_id: int,
         alert_type="RESOLVED",
         run_id=run_id, customer_id=customer_id,
         customer_name=customer_name, env_type=env_type)
+
+
+
+
+INSERT INTO mail_templates (template_key, subject_template, body_html, is_active)
+VALUES (
+  'resolved',
+  '✅ RESOLVED - Health Check - {customer} / {env} - {resolved_count} issue(s) cleared',
+  '<html><body style="font-family:Arial,sans-serif">
+  <p>Dear Team,</p>
+  <p>The following Health Check issues have been <strong style="color:green">RESOLVED</strong>
+  for <strong>{customer}</strong> / <strong>{env}</strong> in Run <strong>#{run_id}</strong>:</p>
+  <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%">
+  <tr style="background:#1565C0;color:#fff;text-align:center">
+    <th>#</th><th>Test ID</th><th>Test Name</th><th>Server</th>
+    <th>Total Failures</th><th>First Failed Run</th><th>Resolved At</th>
+  </tr>
+  {resolved_rows}
+  </table>
+  <p style="color:green;margin-top:16px">✅ All checks are now passing. No further action required.</p>
+  <p>Regards,<br>Health Check System</p>
+  </body></html>',
+  1
+);
