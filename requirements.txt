@@ -8,3 +8,20 @@ WHERE mr.customer_id=%s
 
 INSERT INTO mail_recipients (alert_type, customer_id, to_addresses, cc_addresses, is_active)
 VALUES ('RESOLVED', <your_customer_id>, 'team@example.com', NULL, 1);
+
+
+try:
+    self._send(
+        subject=subject,
+        html=body,
+        plain=f"RESOLVED: {len(resolved_issues)} issue(s) cleared for {customer_name} / {env_type}",
+        to_addr=", ".join(to_list),
+        cc_addr=", ".join(cc_list),
+        alert_type="RESOLVED",
+        run_id=run_id,
+        customer_id=customer_id,
+        customer_name=customer_name,
+        env_type=env_type)
+    self.logger.info(f"Resolved mail sent for {customer_name}/{env_type}")
+except Exception as exc:
+    self.logger.error(f"Resolved mail failed: {exc}")
