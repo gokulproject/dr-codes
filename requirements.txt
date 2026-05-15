@@ -25,3 +25,78 @@ try:
     self.logger.info(f"Resolved mail sent for {customer_name}/{env_type}")
 except Exception as exc:
     self.logger.error(f"Resolved mail failed: {exc}")
+
+
+
+_____________
+
+def send_resolved(self, run_id: int, customer_id: int,
+                  customer_name: str, env_type: str,
+                  resolved_issues: list):
+    """Send resolved notification email when issues are cleared."""
+
+    # Step 1 — recipients from mail_recipients table
+    to_addr, cc_addr = self._recipients("RESOLVED", customer_id)
+    if not to_addr:
+        self.logger.warning("RESOLVED recipients not configured — email skipped")
+        return
+
+    # Step 2 — build resolved rows HTML first (dynamic, can't do in _render loop)
+    from datetime import datetime, timedelta
+    ist_now = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%d-%b-%Y %H:%M IST")
+
+    resolved_rows_html = "".join(
+        f"<tr style='background:{'#f9f9f9' if idx % 2 == 0 else '#ffffff'}'>"
+        f"<td style='padding:6px;border:1px solid #ccc;text-align:center'>{idx}</td>"
+        f"<td style='padding:6px;border:1px solid #ccc;text-align:center'>#{iss.get('test_catalog_id','?')}</td>"
+        f"<td style='padding:6px;border:1px solid #ccc'>{iss.get('test_name','-')}</td>"
+        f"<td style='padding:6px;border:1px solid #ccc'>{iss.get('server_name','-')}</td>"
+        f"<td style='padding:6px;border:1px solid #ccc;text-align:center'>{iss.get('total_failures','-')}</td>"
+        f"<td style='padding:6px;border:1px solid #ccc;text-align:center'>Run #{iss.get('first_failed_run_id','?')}</td>"
+        f"<td style='padding:6px;border:1px solid #ccc'>{ist_now}</td>"
+        f"</tr>"
+        for idx, iss in enumerate(resolved_issues, 1)
+    )
+
+    # Step 3 — ctx dict for _render
+    ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ctx = {
+        "customer":        customer_name,
+        "env":             env_type,
+        "run_id":          run_id,
+        "date_time":       ts,
+        "resolved_count":  len(resolved_issues),
+        "resolved_rows":   resolved_rows_html,
+    }
+
+    # Step 4+5+6 — load template from DB, render subject and body
+    tmpl     = self._tmpl("resolved")
+    subject  = _render(
+        tmpl.get("subject",
+                 f"✅ RESOLVED - Health Check - {customer_name} / {env_type} - "
+                 f"{len(resolved_issues)} issue(s) cleared"),
+        ctx)
+    html_body = _render(
+        tmpl.get("body_html",
+                 f"<p>{len(resolved_issues)} issue(s) resolved for "
+                 f"{customer_name}/{env_type} in Run #{run_id}.</p>"),
+        ctx)
+
+    plain = (
+        f"RESOLVED — Customer: {customer_name} | Env: {env_type} | "
+        f"Run #{run_id}\n\n"
+        f"{len(resolved_issues)} issue(s) cleared:\n" +
+        "\n".join(
+            f"  - Test #{iss.get('test_catalog_id','?')} {iss.get('test_name','')} "
+            f"| Server: {iss.get('server_name','-')} "
+            f"| Total failures: {iss.get('total_failures','-')}"
+            for iss in resolved_issues)
+    )
+
+    # Step 7 — send + auto writes alert_history
+    self._send(
+        subject=subject, html=html_body, plain=plain,
+        to_addr=to_addr, cc_addr=cc_addr,
+        alert_type="RESOLVED",
+        run_id=run_id, customer_id=customer_id,
+        customer_name=customer_name, env_type=env_type)
