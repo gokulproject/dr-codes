@@ -29,3 +29,23 @@ if esc_cfg:
                                 customer_name=cname,
                                 env_type=env_type,
                                 resolved_issues=env_resolved)
+
+
+
+recipients = self.db.fetch_all(
+            """SELECT mr.to_addresses As email_to ,mr.cc_addresses As email_cc
+               FROM mail_recipients mr
+               WHERE mr.customer_id=%s
+                  AND mr.alert_type='RESOLVED'
+                  AND mr.is_active=1""",
+            (customer_id,))
+        if not recipients:
+            # Fallback — use default recipients (customer_id IS NULL)
+            recipients = self.db.fetch_all(
+                """SELECT mr.to_addresses As email_to, mr.cc_addresses As email_cc
+                   FROM mail_recipients mr
+                   WHERE mr.customer_id IS NULL
+                     AND mr.alert_type='RESOLVED'
+                     AND mr.is_active=1""")
+        if not recipients:
+            return
