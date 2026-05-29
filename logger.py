@@ -13,3 +13,19 @@ if not already_ran and start_at_raw is not None:
         fire_utc = candidate
         mode = "start_at PAST -> next slot"
     run_num = 1
+
+
+
+
+if esc_cfg:
+                            _do_resolved = (esc_cfg.get("send_resolved_mail") and
+                                            esc_cfg.get("env_mail_enabled", True))
+                        else:
+                            _do_resolved = True
+                        if _do_resolved:
+                            email_svc.send_resolved(
+                                run_id=self.run_id,
+                                customer_id=customer_id,
+                                customer_name=cname,
+                                env_type=env_type,
+                                resolved_issues=env_resolved)
