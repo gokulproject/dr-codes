@@ -60,3 +60,16 @@ recipients = self.db.fetch_all(
                    value="{{ dash_date }}"
                    title="Filter by run date">
           </div>
+
+
+
+if dash_date:
+            from datetime import datetime, timedelta
+            try:
+                day_start = datetime.strptime(dash_date, "%Y-%m-%d")
+                day_end   = day_start + timedelta(days=1)
+                runs_qs   = runs_qs.filter(
+                    started_at__gte=day_start,
+                    started_at__lt=day_end)
+            except ValueError:
+                pass
