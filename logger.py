@@ -49,3 +49,14 @@ recipients = self.db.fetch_all(
                      AND mr.is_active=1""")
         if not recipients:
             return
+
+
+
+
+
+<div class="col-md-2">
+            <input type="date" name="dash_date"
+                   class="form-control form-control-sm"
+                   value="{{ dash_date }}"
+                   title="Filter by run date">
+          </div>
