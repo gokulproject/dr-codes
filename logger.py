@@ -73,3 +73,9 @@ if dash_date:
                     started_at__lt=day_end)
             except ValueError:
                 pass
+
+
+href="?dash_page={{ runs_page.previous_page_number }}&dash_customer={{ dash_customer }}&dash_status={{ dash_status }}&dash_env={{ dash_env }}&dash_date={{ dash_date }}"
+
+
+href="?dash_page={{ runs_page.next_page_number }}&dash_customer={{ dash_customer }}&dash_status={{ dash_status }}&dash_env={{ dash_env }}&dash_date={{ dash_date }}"
