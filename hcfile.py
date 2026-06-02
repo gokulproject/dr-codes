@@ -96,3 +96,18 @@ et_xmlfile==2.0.0
 Total packages
 14
 22
+
+
+
+
+
+
+
+{% for num in page_obj.paginator.page_range %}
+  {% if num == page_obj.number %}
+    <li class="page-item active"><span class="page-link">{{ num }}</span></li>
+  {% elif num >= page_obj.number|add:"-2" and num <= page_obj.number|add:"2" %}
+    <li class="page-item"><a class="page-link" href="?page={{ num }}&type={{ sel_type }}&customer={{ sel_customer }}">{{ num }}</a></li>
+  {% endif %}
+{% endfor %}
+<li class="page-item disabled"><span class="page-link text-muted">Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span></li>
