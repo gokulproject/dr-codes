@@ -21,3 +21,32 @@ INSERT INTO fmw_config (config_key, config_value, description) VALUES
   ('config_customers', '', 'Comma-sep customer names; empty = ALL'),
   ('config_envs',      '', 'Comma-sep envs DEV,VAL,PRD; empty = ALL')
 ON DUPLICATE KEY UPDATE description = VALUES(description);
+
+
+
+
+import base64, hashlib
+from cryptography.fernet import Fernet
+
+key_password = input("Enter encryption key: ").encode()
+key = base64.urlsafe_b64encode(hashlib.sha256(key_password).digest())
+f = Fernet(key)
+
+text = input("Enter encrypted password: ").encode()
+decrypted = f.decrypt(text)
+
+print("Decrypted:", decrypted.decode())
+
+
+
+import base64, hashlib
+from cryptography.fernet import Fernet
+
+key_password = input("Enter encryption key: ").encode()
+key = base64.urlsafe_b64encode(hashlib.sha256(key_password).digest())
+f = Fernet(key)
+
+text = input("Enter password to encrypt: ").encode()
+encrypted = f.encrypt(text)
+
+print("Encrypted:", encrypted.decode())
