@@ -495,4 +495,36 @@ def _write_fmw_env_sheet(ws, cname: str, env_type: str,
 
         for col, val in enumerate(
             [dr["conn_info"], dr["USERNAME"], dr["ACCOUNT_
+
+
+
+
+-------
+
+
+# Expiry columns — only for FMW db_type
+        db_type_val = r.get("db_type", "").upper()
+        if db_type_val == "FMW":
+            if stat == "FAILED":
+                # Connection failed — query never ran, expiry status is unknown
+                expiry_display = "Unknown"
+                reason_str     = "DB connection failed — expiry not verified"
+            else:
+                key = (r.get("customer_name", ""), r.get("env_type", ""))
+                expired_str, action_str, reason_str = expiry_map.get(key, ("No", "No", ""))
+                expiry_display = f"{expired_str} / {action_str}"
+        else:
+            expiry_display = ""
+            reason_str     = ""
+
+if col == 15 and db_type_val == "FMW":  # Expired / Action Required
+                if expiry_display.startswith("Yes"):
+                    c.font = Font(name="Calibri", size=10, bold=True, color=C_DARK_RED)
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+                elif expiry_display == "Unknown":
+                    c.font = Font(name="Calibri", size=10, bold=True, color=C_AMBER)
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    c.font = Font(name="Calibri", size=10, bold=True, color=C_DARK_GRN)
+                    c.alignment = Alignment(horizontal="center", vertical="center")
              
