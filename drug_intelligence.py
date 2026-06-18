@@ -1,1082 +1,972 @@
 """
-Drug Intelligence Module - Main Workflow Orchestration
-Coordinates the complete end-to-end drug intelligence automation process
-Manages master tracker processing, customer file processing, and report generation
-"""
+checker.py — Oracle DB connection check logic.
 
+Flow per customer/environment:
+  1. Load customer from health_check.Customers (read-only)
+  2. Load environments from health_check.Environments (read-only)
+  3. Map DB server from health_check.Servers (ServerName='DB Server')
+  4. Load Oracle DBs from health_check.OracleDatabase (filtered by db_type)
+  5. Connect using oracledb — thick if oracle_dll_path set, else thin
+  6. Classify any error: TCP_TIMEOUT | PASSWORD | UNKNOWN
+  7. Write one row per Oracle DB to process_db_connection_result
+
+No WMI. No connection timeout configured (OS/driver default applies).
+"""
+import logging
 import os
-import shutil
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
+import sys
+import time
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from Common.crypto     import decrypt_password, is_encrypted
+from Common.db_manager import DBManager
+from config            import HC_DB, FMWCHECKS_DB
+
+log = logging.getLogger("checker.checker")
+
+ALL_ENV_TYPES = ["DEV", "VAL", "PRD"]
+IST           = timedelta(hours=5, minutes=30)
+
+# ── Error classification ──────────────────────────────────────────────────────
+_TCP_KEYWORDS = [
+    "ora-12170", "ora-12541", "ora-12543", "ora-12547",
+    "tns-12535", "tns-12606", "tns-12609",
+    "connection timed out", "timed out", "timeout",
+    "connect timeout", "tcp", "network adapter",
+    "no listener", "unable to connect to oracle",
+]
+_PWD_KEYWORDS = [
+    "ora-28001", "ora-28002", "ora-28003", "ora-28000", "ora-28009",
+    "ora-01017", "ora-01005",
+    "invalid username/password", "logon denied",
+    "password expired", "password has expired", "account is locked",
+]
+
+ERROR_TCP = "TCP_TIMEOUT"
+ERROR_PWD = "PASSWORD"
+ERROR_UNK = "UNKNOWN"
 
 
-class DrugIntelligenceWorkflow:
-    """
-    Main workflow orchestrator for Drug Intelligence Automation
-    """
-    
-    def __init__(self, config, db_manager, excel_manager, processor, email_sender, logger):
-        """
-        Initialize Drug Intelligence Workflow
-        
-        Args:
-            config: Configuration object
-            db_manager: Database manager instance
-            excel_manager: Excel manager instance
-            processor: Drug data processor instance
-            email_sender: Email sender instance
-            logger: Logger instance
-        """
-        self.config = config
-        self.db = db_manager
-        self.excel = excel_manager
-        self.processor = processor
-        self.email = email_sender
-        self.logger = logger
-        
-        # Process tracking
-        self.total_customers = 0
-        self.processed_customers = 0
-        self.failed_customers = 0
-    
-    def initialize_process(self) -> bool:
-        """
-        Initialize the drug intelligence process
-        Sets up directories, validates files, and prepares database
-        
-        Returns:
-            bool: True if initialization successful
-        """
+def classify_error(msg: str) -> str:
+    if not msg:
+        return ERROR_UNK
+    lower = msg.lower()
+    if any(k in lower for k in _TCP_KEYWORDS):
+        return ERROR_TCP
+    if any(k in lower for k in _PWD_KEYWORDS):
+        return ERROR_PWD
+    return ERROR_UNK
+
+
+class Checker:
+
+    def __init__(self, run_id: int, app_cfg=None):
+        self.run_id  = run_id
+        self.cfg     = app_cfg
+        self._dll    = getattr(app_cfg, "oracle_dll_path",  "") if app_cfg else ""
+        self._custs  = getattr(app_cfg, "config_customers", []) if app_cfg else []
+        self._envs   = getattr(app_cfg, "config_envs",      []) if app_cfg else []
+        self.db_types = getattr(app_cfg, "config_dbtype", ["FMW"]) if app_cfg else ["FMW"]
+        self.db_label = getattr(app_cfg, "report_label", "/".join(self.db_types)) \
+            if app_cfg else "/".join(self.db_types)
+        self._thick  = False
+        self._init_oracle_client()
+
+    # ── Oracle client init ────────────────────────────────────────────────────
+
+    def _init_oracle_client(self):
         try:
-            if self.logger:
-                self.logger.log_process_step("Process Initialization", "STARTED")
-            
-            # Create necessary directories
-            directories = [
-                self.config.paths.get('master_tracker_dirpath'),
-                self.config.paths.get('client_dirpath'),
-                self.config.paths.get('bot_outpath'),
-                self.config.paths.get('bot_processpath'),
-                self.config.paths.get('bot_processedpath'),
-                self.config.paths.get('bot_failedpath'),
-                self.config.paths.get('bot_inprogresspath')
-            ]
-            
-            for directory in directories:
-                if directory:
+            import oracledb
+            dll = self._dll
+            if not dll or not dll.strip():
+                log.warning("  Oracle DLL path not set in app_config — running in THIN mode")
+                log.warning("  Set oracle_dll_path to the Instant Client folder to enable thick mode")
+                return
+            if not os.path.isdir(dll):
+                log.warning(f"  Oracle DLL path not found: {dll} — running in THIN mode")
+                return
+            if not os.listdir(dll):
+                log.warning(f"  Oracle DLL folder is empty: {dll} — running in THIN mode")
+                return
+            oracledb.init_oracle_client(lib_dir=dll)
+            self._thick = True
+            log.info(f"  Oracle THICK mode initialised  |  path = {dll}")
+        except Exception as e:
+            log.warning(f"  Oracle client init failed ({e}) — running in THIN mode")
+
+    # ── Oracle DB connection check + FMW query (single connection) ───────────
+
+    def _check_db(self, info: dict) -> tuple:
+        # Opens ONE connection per DB entry — connectivity check + FMW query on same conn.
+        # Returns: (connected, error_msg, error_type, duration_ms, fmw_rows, fmw_query_ran)
+        # fmw_query_ran = True  → query executed successfully (rows may still be empty)
+        # fmw_query_ran = False → query never ran (not FMW, failed conn, error, not configured)
+        import oracledb
+
+        host    = info["db_host"]
+        port    = int(info.get("db_port", 1521))
+        service = info["db_service"]
+        user    = info["db_user"]
+        raw_pwd = info["db_password"]
+        name    = info["db_name"]
+        cname   = info["customer_name"]
+        env     = info["env_type"]
+        dtype   = info.get("db_type", "").upper()
+
+        try:
+            pwd = decrypt_password(raw_pwd) if is_encrypted(raw_pwd) else raw_pwd
+        except Exception as e:
+            log.warning(f"    Password decrypt warning ({e}) — using raw value")
+            pwd = raw_pwd
+
+        dsn  = f"{host}:{port}/{service}"
+        mode = "THICK" if self._thick else "THIN"
+        log.info(f"    Connecting  {cname} / {env} / {name}  [{dtype}]  {dsn}  ({mode})")
+
+        start         = time.time()
+        conn          = None
+        fmw_rows      = []
+        fmw_query_ran = False  # stays False unless query runs without exception
+
+        try:
+            conn = oracledb.connect(user=user, password=pwd, dsn=dsn)
+            ms   = int((time.time() - start) * 1000)
+            log.info(f"    CONNECTED   {cname} / {env} / {name}  ({ms} ms)")
+
+            # FMW query runs on the same open connection — only for FMW db_type
+            if dtype == "FMW":
+                fmw_query = getattr(self.cfg, "fmw_query", "") if self.cfg else ""
+                if not fmw_query:
+                    # fmw_query_ran stays False — query not configured
+                    log.warning("    FMW query not configured in app_config — skipping")
+                else:
                     try:
-                        os.makedirs(directory, exist_ok=True)
-                        if self.logger:
-                            self.logger.debug(f"✅ Directory ensured: {directory}")
-                    except Exception as e:
-                        if self.logger:
-                            self.logger.warning(f"⚠️ Could not create directory {directory}: {str(e)}")
-            
-            # Check for master tracker files
-            master_tracker_dir = self.config.paths.get('master_tracker_dirpath')
-            if not master_tracker_dir or not os.path.exists(master_tracker_dir):
-                raise Exception("Master tracker directory not found")
-            
-            list_excel_files = [f for f in os.listdir(master_tracker_dir) if f.endswith('.xlsx')]
-            
-            if not list_excel_files:
-                if self.logger:
-                    self.logger.warning("⚠️ No Master Tracker files found")
-                return False
-            
-            # Check for client files
-            client_dir = self.config.paths.get('client_dirpath')
-            client_files = self._list_files_recursive(client_dir, ['.xls', '.xlsx'])
-            
-            if not client_files:
-                if self.logger:
-                    self.logger.warning("⚠️ No client files found")
-                return False
-            
-            if self.logger:
-                self.logger.info(f"✅ Found {len(list_excel_files)} master tracker file(s)")
-                self.logger.info(f"✅ Found {len(client_files)} client file(s)")
-            
-            # Set master tracker file
-            master_tracker_filename = list_excel_files[0]
-            self.config.master_tracker_filename = master_tracker_filename
-            
-            # Move to inprogress
-            if not self.move_to_inprogress():
-                raise Exception("Failed to move master tracker to inprogress")
-            
-            # Validate master tracker
-            if not self.validate_master_tracker():
-                raise Exception("Master tracker validation failed")
-            
-            if self.logger:
-                self.logger.log_process_step("Process Initialization", "COMPLETED")
-            
-            return True
-            
+                        log.info(f"    FMW Query  {cname} / {env} / {name}  —  executing OAM user query")
+                        cursor = conn.cursor()
+                        cursor.execute(fmw_query)
+                        cols = [desc[0].upper() for desc in cursor.description]
+                        for row in cursor.fetchall():
+                            row_dict = {}
+                            for col, val in zip(cols, row):
+                                if hasattr(val, "strftime"):
+                                    row_dict[col] = val.strftime("%d-%b-%Y")
+                                else:
+                                    row_dict[col] = str(val) if val is not None else ""
+                            fmw_rows.append(row_dict)
+                        fmw_query_ran = True  # query ran — zero rows is still a valid result
+                        log.info(f"    FMW Query  {cname} / {env} / {name}  —  {len(fmw_rows)} OAM account(s) returned")
+                    except Exception as qe:
+                        fmw_query_ran = False  # query threw an error — treat as not ran
+                        log.error(f"    FMW Query  {cname} / {env} / {name}  —  query failed: {qe}")
+                        fmw_rows = []
+
+            return True, None, "", ms, fmw_rows, fmw_query_ran
+
         except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Process initialization failed: {str(e)}")
-                self.logger.log_exception("initialize_process", e)
-                self.logger.log_process_step("Process Initialization", "FAILED")
-            return False
-    
-    def _list_files_recursive(self, directory: str, extensions: List[str]) -> List[str]:
-        """
-        List all files recursively with given extensions
-        
-        Args:
-            directory: Directory to search
-            extensions: List of file extensions (e.g., ['.xls', '.xlsx'])
-            
-        Returns:
-            List of file paths
-        """
-        files = []
+            ms       = int((time.time() - start) * 1000)
+            err      = str(e)
+            err_type = classify_error(err)
+            log.error(f"    FAILED      {cname} / {env} / {name}  ({ms} ms)  [{err_type}]")
+            log.error(f"                {err}")
+            # Connection failed — fmw_query_ran stays False
+            return False, err, err_type, ms, [], False
+
+        finally:
+            # Single close — connection opened exactly once above
+            if conn:
+                try:   conn.close()
+                except Exception: pass
+
+    # ── health_check reads (READ ONLY) ────────────────────────────────────────
+
+    def _customers(self, db):
+        if self._custs:
+            ph = ",".join(["%s"] * len(self._custs))
+            rows = db.fetch_all(
+                f"SELECT CustomerID AS customer_id, CustomerName AS customer_name "
+                f"FROM Customers WHERE CustomerName IN ({ph}) AND Status=1 "
+                f"ORDER BY CustomerName",
+                tuple(self._custs))
+        else:
+            rows = db.fetch_all(
+                "SELECT CustomerID AS customer_id, CustomerName AS customer_name "
+                "FROM Customers WHERE Status=1 ORDER BY CustomerName")
+        log.info(f"  Customers loaded  :  {len(rows)} found"
+                 + (f"  (filter: {self._custs})" if self._custs else "  (all active)"))
+        return rows
+
+    def _envs_for(self, db, cid):
+        scope = self._envs or ALL_ENV_TYPES
+        ph    = ",".join(["%s"] * len(scope))
+        return db.fetch_all(
+            f"SELECT EnvID AS env_id, ServerType AS env_type "
+            f"FROM Environments "
+            f"WHERE CustomerID=%s AND ServerType IN ({ph}) AND Status=1 "
+            f"ORDER BY FIELD(ServerType,'DEV','VAL','PRD')",
+            tuple([cid] + scope))
+
+    def _server_for(self, db, env_id):
+        return db.fetch_one(
+            "SELECT ServerID AS server_id, ServerName AS server_name, Host AS host "
+            "FROM Servers "
+            "WHERE EnvID=%s AND ServerName='DB Server' AND Status=1 LIMIT 1",
+            (env_id,))
+
+    def _oracle_dbs(self, db, server_id):
+        ph = ",".join(["%s"] * len(self.db_types))
+        return db.fetch_all(
+            f"SELECT dbid AS db_id, OrdName AS db_name, OrdName AS db_service, "
+            f"Port AS db_port, User AS db_user, Password AS db_password, "
+            f"DatabaseType AS db_type "
+            f"FROM OracleDatabase "
+            f"WHERE ServerID=%s AND DatabaseType IN ({ph}) AND Status=1",
+            tuple([server_id] + self.db_types))
+
+    # ── Result helpers ────────────────────────────────────────────────────────
+
+    def _row(self, cid, cname, env_type,
+             server_id=0, server_name="", server_host="",
+             db_name="", db_type=None, db_host="", db_port=0, db_service="",
+             status="SKIPPED", error="", error_type="", ms=0) -> dict:
+        return {
+            "run_id": self.run_id, "customer_id": cid,
+            "customer_name": cname, "env_type": env_type,
+            "server_id": server_id, "server_name": server_name,
+            "server_host": server_host,
+            "db_name": db_name,
+            "db_type": db_type if db_type is not None else "/".join(self.db_types),
+            "db_host": db_host, "db_port": db_port, "db_service": db_service,
+            "connection_status": status, "error_message": error,
+            "error_type": error_type, "duration_ms": ms,
+            "checked_at": datetime.utcnow(),
+            "fmw_query_rows": [],   # skipped rows — no query ran
+            "fmw_query_ran":  False,
+        }
+
+    def _save(self, result: dict):
         try:
-            for root, dirs, filenames in os.walk(directory):
-                for filename in filenames:
-                    if any(filename.lower().endswith(ext) for ext in extensions):
-                        files.append(os.path.join(root, filename))
+            with DBManager(cfg=FMWCHECKS_DB) as db:
+                db.execute(
+                    "INSERT INTO process_db_connection_result "
+                    "(run_id,customer_id,customer_name,env_type,"
+                    "server_id,server_name,server_host,"
+                    "db_name,db_type,db_host,db_port,db_service,"
+                    "connection_status,error_message,error_type,"
+                    "duration_ms,checked_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (result["run_id"],
+                     result["customer_id"], result["customer_name"], result["env_type"],
+                     result["server_id"],   result["server_name"],   result["server_host"],
+                     result["db_name"],     result["db_type"],       result["db_host"],
+                     result["db_port"],     result["db_service"],
+                     result["connection_status"], result["error_message"],
+                     result["error_type"],  result["duration_ms"],   result["checked_at"]))
         except Exception as e:
-            if self.logger:
-                self.logger.warning(f"⚠️ Error listing files in {directory}: {str(e)}")
-        
-        return files
-    
-    def move_to_inprogress(self) -> bool:
-        """
-        Move master tracker file to inprogress folder and create process record
-        
-        Returns:
-            bool: True if successful
-        """
-        try:
-            if self.logger:
-                self.logger.info("⏳ Moving master tracker to inprogress...")
-            
-            # Insert process status record
-            process_status_table = self.config.get_table_name('process_status')
-            
-            query = f"""
-                INSERT INTO {process_status_table}
-                (process_status, mt_filename, start_datetime)
-                VALUES (%s, %s, NOW())
-            """
-            
-            params = ('Initiated', self.config.master_tracker_filename)
-            self.db.execute_update(query, params)
-            
-            # Get process ID
-            process_id = self.db.get_max_id(
-                process_status_table,
-                'process_id'
-            )
-            
-            if not process_id:
-                raise Exception("Failed to get process ID")
-            
-            self.config.process_id = process_id
-            
-            if self.logger:
-                self.logger.success(f"✅ Process ID created: {process_id}")
-            
-            # Create and clean inprogress directory
-            inprogress_dir = self.config.paths.get('bot_inprogresspath')
-            os.makedirs(inprogress_dir, exist_ok=True)
-            
-            # Clean inprogress directory
-            for item in os.listdir(inprogress_dir):
-                item_path = os.path.join(inprogress_dir, item)
-                try:
-                    if os.path.isfile(item_path):
-                        os.remove(item_path)
-                    elif os.path.isdir(item_path):
-                        shutil.rmtree(item_path)
-                except Exception as e:
-                    if self.logger:
-                        self.logger.warning(f"⚠️ Could not remove {item_path}: {str(e)}")
-            
-            # Move master tracker file
-            source_path = os.path.join(
-                self.config.paths.get('master_tracker_dirpath'),
-                self.config.master_tracker_filename
-            )
-            
-            dest_path = os.path.join(
-                inprogress_dir,
-                self.config.master_tracker_filename
-            )
-            
-            shutil.move(source_path, dest_path)
-            
-            # Update path in config
-            self.config.paths['master_tracker_path'] = dest_path
-            
-            if self.logger:
-                self.logger.success(f"✅ Master tracker moved to inprogress")
-            
-            # Update status
-            self.update_process_status('File Moved to Inprogress')
-            
-            return True
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Failed to move to inprogress: {str(e)}")
-                self.logger.log_exception("move_to_inprogress", e)
-            return False
-    
-    def validate_master_tracker(self) -> bool:
-        """
-        Validate master tracker file structure and columns
-        
-        Returns:
-            bool: True if validation successful
-        """
-        try:
-            if self.logger:
-                self.logger.info("⏳ Validating master tracker file...")
-            
-            self.update_process_status('Master Tracker Validation Initiated')
-            
-            # Get column names to validate
-            mt_columnnames_table = self.config.table_names.get('mt_columnnames_table')
-            
-            query = f"""
-                SELECT excel_colname
-                FROM {mt_columnnames_table}
-                WHERE status = '1'
-            """
-            
-            result = self.db.execute_query(query)
-            
-            if not result:
-                raise Exception("No column names found in configuration")
-            
-            column_names = [row[0] for row in result]
-            
-            # Add product column and comment column
-            product_col = self.config.master_tracker_config.get('mater_tracker_productcol')
-            comment_col = self.config.master_tracker_config.get('comment_colname')
-            
-            full_colnames = [product_col] + column_names + [comment_col]
-            
-            # Validate using Excel parser
-            master_tracker_path = self.config.paths.get('master_tracker_path')
-            master_sheetname = self.config.master_tracker_config.get('master_sheetname')
-            
+            log.error(f"  DB write failed: {e}")
+
+    def _save_fmw_results(self, run_id: int, result: dict, fmw_rows: list):
+        # Writes each OAM account row to fmw_query_result — called only when query ran successfully
+        customer_name = result.get("customer_name", "")
+        env_type      = result.get("env_type",      "")
+        server_host   = result.get("server_host",   "")
+        db_name       = result.get("db_name",       "")
+        db_type       = result.get("db_type",       "")
+        conn_ref      = f"{server_host} / {db_name} / {db_type}"
+
+        if not fmw_rows:
+            # Query ran but returned zero OAM accounts — write one blank row to capture the event
             try:
-                result = self.excel.parse_excel_with_dynamic_header(
-                    master_tracker_path,
-                    master_sheetname,
-                    full_colnames
-                )
-                
-                if not result:
-                    raise Exception("Master tracker validation failed - columns or sheet not found")
-                    
+                with DBManager(cfg=FMWCHECKS_DB) as db:
+                    db.execute(
+                        "INSERT INTO fmw_query_result "
+                        "(run_id, customer_name, env_type, server_db_info, "
+                        " username, account_status, expiry_date, "
+                        " action_required, reason, queried_at) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
+                        (run_id, customer_name, env_type, conn_ref,
+                         "", "", "", "No", "",))
             except Exception as e:
-                error_msg = f"Wrong Master Tracker File was uploaded - Column/Sheet not found: {str(e)}"
-                self.move_to_failed(error_msg)
-                return False
-            
-            # Get comment column number
-            comment_colno = self.excel.get_column_number(
-                master_tracker_path,
-                master_sheetname,
-                comment_col
-            )
-            
-            self.config.master_tracker_config['comment_colno'] = comment_colno
-            self.config.master_tracker_config['mt_column_names'] = column_names
-            
-            if self.logger:
-                self.logger.success("✅ Master tracker validation completed")
-            
-            self.update_process_status('Master Tracker Validation Completed')
-            
-            return True
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Master tracker validation failed: {str(e)}")
-                self.logger.log_exception("validate_master_tracker", e)
-            return False
-    
-    def update_process_status(self, status: str) -> bool:
-        """
-        Update process status in database
-        
-        Args:
-            status: New status message
-            
-        Returns:
-            bool: True if successful
-        """
+                log.error(f"  fmw_query_result write failed (no-rows): {e}")
+            return
+
+        for frow in fmw_rows:
+            expiry          = frow.get("EXPIRY_DATE", "") or ""
+            expiry_set      = expiry.strip().upper() not in ("", "NULL", "NONE")
+            action_required = "Yes" if expiry_set else "No"
+            reason          = expiry.strip() if expiry_set else ""
+            try:
+                with DBManager(cfg=FMWCHECKS_DB) as db:
+                    db.execute(
+                        "INSERT INTO fmw_query_result "
+                        "(run_id, customer_name, env_type, server_db_info, "
+                        " username, account_status, expiry_date, "
+                        " action_required, reason, queried_at) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
+                        (run_id, customer_name, env_type, conn_ref,
+                         frow.get("USERNAME",       ""),
+                         frow.get("ACCOUNT_STATUS", ""),
+                         expiry,
+                         action_required,
+                         reason))
+            except Exception as e:
+                log.error(f"  fmw_query_result write failed: {e}")
+
+    def _log_step(self, no, name, status, msg="", cust="", env=""):
         try:
-            process_status_table = self.config.get_table_name('process_status')
-            
-            query = f"""
-                UPDATE {process_status_table}
-                SET process_status = %s
-                WHERE process_id = %s
-            """
-            
-            params = (status, self.config.process_id)
-            self.db.execute_update(query, params)
-            
-            if self.logger:
-                self.logger.debug(f"Process status updated: {status}")
-            
-            return True
-            
+            with DBManager(cfg=FMWCHECKS_DB) as db:
+                db.execute(
+                    "INSERT INTO process_run_log "
+                    "(run_id,step_no,step_name,status,message,customer,env_type,logged_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())",
+                    (self.run_id, no, name, status,
+                     (msg  or "")[:2000],
+                     (cust or "")[:255],
+                     (env  or "")[:50]))
         except Exception as e:
-            if self.logger:
-                self.logger.warning(f"⚠️ Failed to update process status: {str(e)}")
-            return False
-    
-    def move_to_failed(self, error_message: str) -> None:
-        """
-        Move files to failed directory and send failure notification
-        
-        Args:
-            error_message: Error message describing the failure
-        """
+            log.warning(f"  Step log write failed: {e}")
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
+    def run_all(self) -> list:
+        results   = []
+        env_scope = self._envs or ALL_ENV_TYPES
+
+        log.info(f"[Step 3]  Loading customers  |  db_types={self.db_types}  |  envs={env_scope}")
+        self._log_step(3, "IDENTIFY_CUSTOMERS", "STARTED",
+                       f"customer_filter={'ALL' if not self._custs else self._custs}  |  "
+                       f"env_filter={'ALL' if not self._envs else self._envs}  |  "
+                       f"db_type={self.db_types}")
+
         try:
-            if self.logger:
-                self.logger.error(f"❌ Moving to failed: {error_message}")
-            
-            # Create failed directory with process ID
-            failed_dir = os.path.join(
-                self.config.paths.get('bot_failedpath'),
-                str(self.config.process_id)
-            )
-            os.makedirs(failed_dir, exist_ok=True)
-            
-            # Move master tracker to failed
-            master_tracker_path = self.config.paths.get('master_tracker_path')
-            if master_tracker_path and os.path.exists(master_tracker_path):
+            with DBManager(cfg=HC_DB) as db:
+                customers = self._customers(db)
+        except Exception as e:
+            log.error(f"  Cannot load customers: {e}")
+            self._log_step(3, "IDENTIFY_CUSTOMERS", "FAILED", str(e))
+            return []
+
+        if not customers:
+            log.warning("  No active customers found")
+            self._log_step(3, "IDENTIFY_CUSTOMERS", "SKIPPED", "No active customers")
+            return []
+
+        self._log_step(3, "IDENTIFY_CUSTOMERS", "COMPLETED",
+                       f"{len(customers)} customer(s) found")
+
+        for cust in customers:
+            cid   = cust["customer_id"]
+            cname = cust["customer_name"]
+
+            log.info("")
+            log.info(f"  ── Customer: {cname}  (ID={cid})")
+
+            # Load environments
+            try:
+                with DBManager(cfg=HC_DB) as db:
+                    envs = self._envs_for(db, cid)
+            except Exception as e:
+                log.error(f"    Cannot load environments: {e}")
+                self._log_step(4, "IDENTIFY_ENVIRONMENTS", "FAILED", str(e), cname)
+                continue
+
+            if not envs:
+                msg = f"No active environments found (filter={env_scope})"
+                log.warning(f"    {msg}")
+                self._log_step(4, "IDENTIFY_ENVIRONMENTS", "SKIPPED", msg, cname)
+                r = self._row(cid, cname, ",".join(env_scope),
+                              error=msg, status="SKIPPED")
+                self._save(r); results.append(r)
+                continue
+
+            log.info(f"    Environments : {[e['env_type'] for e in envs]}")
+            self._log_step(4, "IDENTIFY_ENVIRONMENTS", "COMPLETED",
+                           f"found: {[e['env_type'] for e in envs]}", cname)
+
+            for env in envs:
+                env_id   = env["env_id"]
+                env_type = env["env_type"]
+
+                log.info(f"    ── Env: {env_type}  (EnvID={env_id})")
+
+                # Map DB server
                 try:
-                    shutil.move(master_tracker_path, failed_dir)
+                    with DBManager(cfg=HC_DB) as db:
+                        server = self._server_for(db, env_id)
                 except Exception as e:
-                    if self.logger:
-                        self.logger.warning(f"⚠️ Could not move master tracker: {str(e)}")
-            
-            # Move output directory if exists
-            output_dir = os.path.join(
-                self.config.paths.get('bot_outpath'),
-                str(self.config.process_id)
-            )
-            
-            if os.path.exists(output_dir):
-                try:
-                    shutil.move(output_dir, failed_dir)
-                except Exception as e:
-                    if self.logger:
-                        self.logger.warning(f"⚠️ Could not move output directory: {str(e)}")
-            
-            # Update database status
-            process_status_table = self.config.get_table_name('process_status')
-            
-            query = f"""
-                UPDATE {process_status_table}
-                SET process_status = 'Failed',
-                    error_message = %s,
-                    end_datetime = NOW()
-                WHERE process_id = %s
-            """
-            
-            params = (error_message, self.config.process_id)
-            self.db.execute_update(query, params)
-            
-            # Send failure email
-            attachment_path = os.path.join(failed_dir, self.config.master_tracker_filename)
-            
-            self.email.send_failure_notification(
-                mail_config=self.config.mail_config,
-                process_id=str(self.config.process_id),
-                filename=self.config.master_tracker_filename,
-                error_message=error_message,
-                attachment_path=attachment_path if os.path.exists(attachment_path) else None
-            )
-            
-            if self.logger:
-                self.logger.error(f"Process failed: {error_message}")
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Error in move_to_failed: {str(e)}")
-                self.logger.log_exception("move_to_failed", e)
-
-"""
-Drug Intelligence Module - Part 2
-Customer processing and file management methods
-"""
-
-# ADD THESE METHODS TO THE DrugIntelligenceWorkflow CLASS
-
-    def master_tracker_update(self) -> bool:
-        """
-        Main master tracker update workflow
-        Processes all active customers
-        
-        Returns:
-            bool: True if successful
-        """
-        try:
-            if self.logger:
-                self.logger.log_process_step("Master Tracker Update", "STARTED")
-            
-            # Get active customers
-            customer_table = self.config.get_table_name('customer_table')
-            
-            query = f"""
-                SELECT customer_id, customer_name
-                FROM {customer_table}
-                WHERE status = 1
-                ORDER BY customer_id
-            """
-            
-            customer_list = self.db.execute_query(query)
-            
-            if not customer_list:
-                if self.logger:
-                    self.logger.warning("⚠️ No active customers found")
-                return False
-            
-            self.total_customers = len(customer_list)
-            
-            if self.logger:
-                self.logger.info(f"✅ Found {self.total_customers} active customer(s)")
-            
-            # Process each customer
-            for customer_id, customer_name in customer_list:
-                try:
-                    if self.logger:
-                        self.logger.info(f"⏳ Processing customer: {customer_name} (ID: {customer_id})")
-                    
-                    if self.execute_each_customer(customer_id, customer_name):
-                        self.processed_customers += 1
-                    else:
-                        self.failed_customers += 1
-                        
-                except Exception as e:
-                    self.failed_customers += 1
-                    if self.logger:
-                        self.logger.error(f"❌ Customer {customer_name} processing failed: {str(e)}")
-                        self.logger.log_exception(f"process_customer_{customer_id}", e)
-            
-            if self.logger:
-                self.logger.log_process_step("Master Tracker Update", "COMPLETED")
-                self.logger.info(f"✅ Processed: {self.processed_customers}/{self.total_customers}")
-                self.logger.info(f"❌ Failed: {self.failed_customers}/{self.total_customers}")
-            
-            return True
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Master tracker update failed: {str(e)}")
-                self.logger.log_exception("master_tracker_update", e)
-                self.logger.log_process_step("Master Tracker Update", "FAILED")
-            return False
-    
-    def execute_each_customer(self, customer_id: int, customer_name: str) -> bool:
-        """
-        Execute processing for a specific customer
-        
-        Args:
-            customer_id: Customer ID
-            customer_name: Customer name
-            
-        Returns:
-            bool: True if processing successful
-        """
-        log_id = None
-        client_filepath = None
-        
-        try:
-            # Get customer subprocess configuration
-            suprocess_info_table = self.config.get_table_name('suprocess_info')
-            
-            query = f"""
-                SELECT suprocess_name, excel_sheetname, excel_startindex, column_names
-                FROM {suprocess_info_table}
-                WHERE customer_id = %s
-            """
-            
-            result = self.db.execute_query(query, (str(customer_id),))
-            
-            if not result or len(result) == 0:
-                if self.logger:
-                    self.logger.warning(f"⚠️ No subprocess configuration found for {customer_name}")
-                return True  # Continue with next customer
-            
-            # Get subprocess details
-            suprocess_name = result[0][0]
-            customer_config = {
-                'excel_sheetname': result[0][1],
-                'excel_startindex': result[0][2],
-                'column_names': result[0][3]
-            }
-            
-            # Find customer directory and files
-            customer_dirpath = os.path.join(
-                self.config.paths.get('client_dirpath'),
-                customer_name
-            )
-            
-            # Create customer directory if not exists
-            os.makedirs(customer_dirpath, exist_ok=True)
-            
-            # List Excel files in customer directory
-            list_files = [
-                f for f in os.listdir(customer_dirpath)
-                if f.lower().endswith(('.xls', '.xlsx'))
-            ]
-            
-            if not list_files:
-                if self.logger:
-                    self.logger.warning(f"⚠️ No files found for customer {customer_name}")
-                return True  # Continue with next customer
-            
-            # Get first file
-            in_client_filepath = os.path.join(customer_dirpath, list_files[0])
-            
-            # Create log entry
-            log_report_table = self.config.get_table_name('log_report')
-            
-            insert_query = f"""
-                INSERT INTO {log_report_table}
-                (process_id, customer_id, initiated_sts, start_datetime, customer_name, filename)
-                VALUES (%s, %s, '1', NOW(), %s, %s)
-            """
-            
-            insert_params = (
-                self.config.process_id,
-                customer_id,
-                customer_name,
-                list_files[0]
-            )
-            
-            self.db.execute_update(insert_query, insert_params)
-            
-            # Get log ID
-            log_id = self.db.get_max_id(
-                log_report_table,
-                'log_id',
-                f"process_id='{self.config.process_id}' AND customer_id='{customer_id}'"
-            )
-            
-            # Move file to inprogress
-            client_inprogress_dir = os.path.join(
-                self.config.paths.get('bot_inprogresspath'),
-                customer_name
-            )
-            
-            os.makedirs(client_inprogress_dir, exist_ok=True)
-            
-            # Clean inprogress directory
-            for item in os.listdir(client_inprogress_dir):
-                item_path = os.path.join(client_inprogress_dir, item)
-                try:
-                    if os.path.isfile(item_path):
-                        os.remove(item_path)
-                except Exception:
-                    pass
-            
-            client_filepath = os.path.join(client_inprogress_dir, list_files[0])
-            shutil.move(in_client_filepath, client_filepath)
-            
-            if self.logger:
-                self.logger.info(f"✅ File moved to inprogress: {list_files[0]}")
-            
-            # Process based on subprocess name
-            process_status = self.process_customer_file(
-                suprocess_name,
-                client_filepath,
-                customer_config
-            )
-            
-            if not process_status:
-                # Move to failed
-                self.move_failed_clientfile(customer_name, client_filepath, log_id)
-                return False
-            
-            # Move to processed
-            self.move_to_processed(customer_name, client_filepath)
-            
-            # Update log as completed
-            update_query = f"""
-                UPDATE {log_report_table}
-                SET completed_sts = '1', end_datetime = NOW()
-                WHERE log_id = %s
-            """
-            
-            self.db.execute_update(update_query, (log_id,))
-            
-            if self.logger:
-                self.logger.success(f"✅ Customer {customer_name} processed successfully")
-            
-            return True
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Failed to process customer {customer_name}: {str(e)}")
-                self.logger.log_exception(f"execute_customer_{customer_id}", e)
-            
-            # Move to failed if file was moved
-            if client_filepath and os.path.exists(client_filepath):
-                self.move_failed_clientfile(customer_name, client_filepath, log_id)
-            
-            return False
-    
-    def process_customer_file(
-        self,
-        subprocess_name: str,
-        client_filepath: str,
-        customer_config: Dict[str, Any]
-    ) -> bool:
-        """
-        Process customer file based on subprocess name
-        
-        Args:
-            subprocess_name: Name of the subprocess (customer type)
-            client_filepath: Path to customer Excel file
-            customer_config: Customer configuration
-            
-        Returns:
-            bool: True if processing successful
-        """
-        try:
-            if self.logger:
-                self.logger.info(f"⏳ Running subprocess: {subprocess_name}")
-            
-            # Map subprocess name to processor method
-            processor_map = {
-                'PROCESS_CAPLIN': self.processor.process_caplin,
-                'PROCESS_BELLS': self.processor.process_bells,
-                'PROCESS_RELONCHEM': self.processor.process_relonchem,
-                'PROCESS_MARKSANS_USA': self.processor.process_marksans_usa,
-                'PROCESS_PADAGIS_USA': self.processor.process_padagis_usa,
-                'PROCESS_PADAGIS_ISRAEL': self.processor.process_padagis_israel
-            }
-            
-            # Get processor method
-            processor_method = processor_map.get(subprocess_name)
-            
-            if not processor_method:
-                if self.logger:
-                    self.logger.error(f"❌ Unknown subprocess: {subprocess_name}")
-                return False
-            
-            # Execute processor
-            result = processor_method(client_filepath, customer_config)
-            
-            return result
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Customer file processing failed: {str(e)}")
-                self.logger.log_exception("process_customer_file", e)
-            return False
-    
-    def move_to_processed(self, customer_name: str, client_filepath: str) -> bool:
-        """
-        Move successfully processed file to processed directory
-        
-        Args:
-            customer_name: Customer name
-            client_filepath: Path to client file
-            
-        Returns:
-            bool: True if successful
-        """
-        try:
-            # Create processed directory for customer
-            processed_customer_dir = os.path.join(
-                self.config.paths.get('bot_processedpath'),
-                str(self.config.process_id),
-                customer_name
-            )
-            
-            os.makedirs(processed_customer_dir, exist_ok=True)
-            
-            # Move file
-            if os.path.exists(client_filepath):
-                shutil.move(client_filepath, processed_customer_dir)
-                
-                if self.logger:
-                    self.logger.info(f"✅ File moved to processed: {customer_name}")
-            
-            return True
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.warning(f"⚠️ Failed to move file to processed: {str(e)}")
-            return False
-    
-    def move_failed_clientfile(
-        self,
-        customer_name: str,
-        client_filepath: str,
-        log_id: Optional[int]
-    ) -> None:
-        """
-        Move failed customer file to failed directory
-        
-        Args:
-            customer_name: Customer name
-            client_filepath: Path to client file
-            log_id: Log ID for database update
-        """
-        try:
-            # Create failed directory for customer
-            failed_customer_dir = os.path.join(
-                self.config.paths.get('bot_failedpath'),
-                str(self.config.process_id),
-                customer_name
-            )
-            
-            os.makedirs(failed_customer_dir, exist_ok=True)
-            
-            # Move file
-            if os.path.exists(client_filepath):
-                filename = os.path.basename(client_filepath)
-                shutil.move(client_filepath, failed_customer_dir)
-                
-                if self.logger:
-                    self.logger.warning(f"⚠️ File moved to failed: {filename}")
-                
-                # Update log record
-                if log_id:
-                    log_report_table = self.config.get_table_name('log_report')
-                    
-                    error_msg = f"Failed while processing {customer_name} customer - {filename}"
-                    
-                    query = f"""
-                        UPDATE {log_report_table}
-                        SET failed_sts = '1',
-                            failure_message = %s,
-                            end_datetime = NOW()
-                        WHERE log_id = %s
-                    """
-                    
-                    self.db.execute_update(query, (error_msg, log_id))
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Error moving failed file: {str(e)}")
-
-
-"""
-Drug Intelligence Module - Part 3
-Report generation and final output methods
-"""
-
-# ADD THESE METHODS TO THE DrugIntelligenceWorkflow CLASS
-
-    def generate_report(self) -> bool:
-        """
-        Generate final Excel reports
-        
-        Returns:
-            bool: True if successful
-        """
-        try:
-            if self.logger:
-                self.logger.log_process_step("Report Generation", "STARTED")
-            
-            # Create output directory
-            di_output_dir = os.path.join(
-                self.config.paths.get('bot_outpath'),
-                str(self.config.process_id)
-            )
-            
-            os.makedirs(di_output_dir, exist_ok=True)
-            
-            # Define report file path
-            di_excel_report = os.path.join(
-                di_output_dir,
-                f"DrugIntelligence_Report_{self.config.process_id}.xlsx"
-            )
-            
-            # Create Excel report with sheets
-            sheet_list = ['Include_Exclude_Count', 'Overall_Report']
-            
-            self.excel.create_excel_with_sheets(di_excel_report, sheet_list)
-            
-            if self.logger:
-                self.logger.success(f"✅ Report file created: {os.path.basename(di_excel_report)}")
-            
-            # Open Excel for writing
-            self.excel.open_excel(di_excel_report)
-            
-            # Generate include/exclude count report
-            self.generate_include_exclude_count_report(di_excel_report)
-            
-            # Generate overall report
-            self.generate_overall_report(di_excel_report)
-            
-            # Close Excel
-            self.excel.close_excel()
-            
-            # Store report path in config
-            self.config.paths['di_excel_report'] = di_excel_report
-            self.config.paths['di_output_dir'] = di_output_dir
-            
-            if self.logger:
-                self.logger.log_process_step("Report Generation", "COMPLETED")
-            
-            return True
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Report generation failed: {str(e)}")
-                self.logger.log_exception("generate_report", e)
-                self.logger.log_process_step("Report Generation", "FAILED")
-            return False
-    
-    def generate_include_exclude_count_report(self, report_path: str) -> bool:
-        """
-        Generate include/exclude count report
-        
-        Args:
-            report_path: Path to report Excel file
-            
-        Returns:
-            bool: True if successful
-        """
-        try:
-            if self.logger:
-                self.logger.info("⏳ Generating Include/Exclude Count Report...")
-            
-            # Truncate count tables
-            overall_count_table = self.config.get_table_name('overall_count_report')
-            inclusion_exclusion_table = self.config.get_table_name('inclusion_exclusion_counts')
-            
-            self.db.truncate_table(overall_count_table)
-            self.db.truncate_table(inclusion_exclusion_table)
-            
-            # Get all customer report tables
-            customer_tables = [
-                ('caplin_master_report', 'Caplin'),
-                ('bells_master_report', 'Bells'),
-                ('relonchem_master_report', 'Relonchem'),
-                ('marksans_usa_master_report', 'Marksans USA'),
-                ('padagis_usa_master_report', 'Padagis USA'),
-                ('padagis_israle_master_report', 'Padagis Israel')
-            ]
-            
-            # Collect statistics
-            stats_data = []
-            
-            for table_key, customer_name in customer_tables:
-                table_name = self.config.get_table_name(table_key)
-                
-                if not table_name:
+                    log.error(f"      Server lookup failed: {e}")
+                    self._log_step(5, "MAP_DB_SERVER", "FAILED", str(e), cname, env_type)
+                    r = self._row(cid, cname, env_type,
+                                  error=f"Server lookup failed: {e}", status="SKIPPED")
+                    self._save(r); results.append(r)
                     continue
-                
-                try:
-                    # Count include/exclude
-                    query = f"""
-                        SELECT 
-                            include_exclude_status,
-                            COUNT(*) as count
-                        FROM {table_name}
-                        WHERE process_id = %s
-                        GROUP BY include_exclude_status
-                    """
-                    
-                    result = self.db.execute_query(query, (self.config.process_id,))
-                    
-                    include_count = 0
-                    exclude_count = 0
-                    
-                    for status, count in result:
-                        if status == 'include':
-                            include_count = count
-                        elif status == 'exclude':
-                            exclude_count = count
-                    
-                    total_count = include_count + exclude_count
-                    
-                    stats_data.append({
-                        'customer': customer_name,
-                        'include': include_count,
-                        'exclude': exclude_count,
-                        'total': total_count
-                    })
-                    
-                except Exception as e:
-                    if self.logger:
-                        self.logger.warning(f"⚠️ Could not get stats for {customer_name}: {str(e)}")
-            
-            # Write to Excel (simplified - you can enhance this)
-            if self.logger:
-                self.logger.success(f"✅ Include/Exclude count report generated with {len(stats_data)} customers")
-            
-            return True
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Failed to generate include/exclude report: {str(e)}")
-            return False
-    
-    def generate_overall_report(self, report_path: str) -> bool:
-        """
-        Generate overall summary report
-        
-        Args:
-            report_path: Path to report Excel file
-            
-        Returns:
-            bool: True if successful
-        """
-        try:
-            if self.logger:
-                self.logger.info("⏳ Generating Overall Report...")
-            
-            # This is a placeholder for overall report generation
-            # You can add the actual logic to generate comprehensive reports
-            
-            if self.logger:
-                self.logger.success("✅ Overall report generated")
-            
-            return True
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Failed to generate overall report: {str(e)}")
-            return False
-    
-    def move_to_bot_out(self) -> bool:
-        """
-        Move final output to BOT-OUT and send success notification
-        
-        Returns:
-            bool: True if successful
-        """
-        try:
-            if self.logger:
-                self.logger.log_process_step("Final Output", "STARTED")
-            
-            # Get completed and failed files
-            log_report_table = self.config.get_table_name('log_report')
-            
-            completed_query = f"""
-                SELECT customer_name, filename
-                FROM {log_report_table}
-                WHERE completed_sts = '1' AND process_id = %s
-            """
-            
-            completed_files = self.db.execute_query(completed_query, (self.config.process_id,))
-            
-            failed_query = f"""
-                SELECT customer_name, filename, failure_message
-                FROM {log_report_table}
-                WHERE failed_sts = '1' AND process_id = %s
-            """
-            
-            failed_files = self.db.execute_query(failed_query, (self.config.process_id,))
-            
-            # Check if all files failed
-            if (not completed_files or len(completed_files) == 0) and failed_files and len(failed_files) > 0:
-                # All failed
-                error_message = "Below files failed during processing:\n\n"
-                error_message += "\n".join([
-                    f"{i+1}) {customer} - {filename} - {error}"
-                    for i, (customer, filename, error) in enumerate(failed_files)
-                ])
-                
-                self.move_to_failed(error_message)
-                return False
-            
-            # Move master tracker to output
-            master_tracker_path = self.config.paths.get('master_tracker_path')
-            di_output_dir = self.config.paths.get('di_output_dir')
-            
-            if master_tracker_path and os.path.exists(master_tracker_path):
-                try:
-                    shutil.copy(master_tracker_path, di_output_dir)
-                except Exception as e:
-                    if self.logger:
-                        self.logger.warning(f"⚠️ Could not copy master tracker: {str(e)}")
-            
-            # Collect attachments
-            attachments = []
-            
-            for file in os.listdir(di_output_dir):
-                if file.endswith('.xlsx') and 'Conflict' not in file:
-                    attachments.append(os.path.join(di_output_dir, file))
-            
-            # Send success email
-            self.email.send_success_notification(
-                mail_config=self.config.mail_config,
-                process_id=str(self.config.process_id),
-                filename=self.config.master_tracker_filename,
-                success_files=completed_files if completed_files else [],
-                failed_files=failed_files if failed_files else [],
-                attachments=attachments
-            )
-            
-            # Clean inprogress directory
-            try:
-                inprogress_dir = self.config.paths.get('bot_inprogresspath')
-                for item in os.listdir(inprogress_dir):
-                    item_path = os.path.join(inprogress_dir, item)
-                    try:
-                        if os.path.isfile(item_path):
-                            os.remove(item_path)
-                        elif os.path.isdir(item_path):
-                            shutil.rmtree(item_path)
-                    except Exception:
-                        pass
-            except Exception as e:
-                if self.logger:
-                    self.logger.warning(f"⚠️ Could not clean inprogress: {str(e)}")
-            
-            if self.logger:
-                self.logger.log_process_step("Final Output", "COMPLETED")
-                self.logger.success("✅ Success notification sent")
-            
-            return True
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Failed to move to BOT-OUT: {str(e)}")
-                self.logger.log_exception("move_to_bot_out", e)
-                self.logger.log_process_step("Final Output", "FAILED")
-            return False
-    
-    def complete_process(self) -> bool:
-        """
-        Mark process as completed in database
-        
-        Returns:
-            bool: True if successful
-        """
-        try:
-            process_status_table = self.config.get_table_name('process_status')
-            
-            query = f"""
-                UPDATE {process_status_table}
-                SET process_status = 'Completed',
-                    end_datetime = NOW()
-                WHERE process_id = %s
-            """
-            
-            self.db.execute_update(query, (self.config.process_id,))
-            
-            if self.logger:
-                self.logger.success("✅ Process marked as completed in database")
-            
-            return True
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ Failed to complete process: {str(e)}")
-            return False
 
-                
+                if not server:
+                    msg = "No active 'DB Server' row in health_check.Servers"
+                    log.warning(f"      {msg}")
+                    self._log_step(5, "MAP_DB_SERVER", "SKIPPED", msg, cname, env_type)
+                    r = self._row(cid, cname, env_type, error=msg, status="SKIPPED")
+                    self._save(r); results.append(r)
+                    continue
+
+                server_id   = server["server_id"]
+                server_name = server["server_name"]
+                server_host = server["host"]
+                log.info(f"      DB Server  :  {server_name}  |  host={server_host}  (ID={server_id})")
+                self._log_step(5, "MAP_DB_SERVER", "COMPLETED",
+                               f"name={server_name} id={server_id} host={server_host}",
+                               cname, env_type)
+
+                # Load Oracle DBs
+                try:
+                    with DBManager(cfg=HC_DB) as db:
+                        dbs = self._oracle_dbs(db, server_id)
+                except Exception as e:
+                    log.error(f"      Oracle DB lookup failed: {e}")
+                    self._log_step(6, "LOAD_DB_TYPES", "FAILED", str(e), cname, env_type)
+                    r = self._row(cid, cname, env_type,
+                                  server_id=server_id, server_name=server_name,
+                                  server_host=server_host, db_host=server_host,
+                                  error=f"DB lookup failed: {e}", status="SKIPPED")
+                    self._save(r); results.append(r)
+                    continue
+
+                if not dbs:
+                    msg = f"No active Oracle DB found for db_type={self.db_types}"
+                    log.warning(f"      {msg}")
+                    self._log_step(6, "LOAD_DB_TYPES", "SKIPPED", msg, cname, env_type)
+                    r = self._row(cid, cname, env_type,
+                                  server_id=server_id, server_name=server_name,
+                                  server_host=server_host, db_host=server_host,
+                                  error=msg, status="SKIPPED")
+                    self._save(r); results.append(r)
+                    continue
+
+                log.info(f"      Oracle DBs : {len(dbs)} found  (type={self.db_types})")
+                self._log_step(6, "LOAD_DB_TYPES", "COMPLETED",
+                               f"{len(dbs)} DB(s)", cname, env_type)
+
+                for tdb in dbs:
+                    info = {
+                        "customer_id":  cid,
+                        "customer_name": cname,
+                        "env_type":     env_type,
+                        "db_name":      tdb["db_name"],
+                        "db_type":      tdb.get("db_type", ""),
+                        "db_host":      server_host,
+                        "db_port":      tdb.get("db_port", 1521),
+                        "db_service":   tdb["db_service"],
+                        "db_user":      tdb["db_user"],
+                        "db_password":  tdb["db_password"],
+                    }
+
+                    # Unpack 6 values — fmw_query_ran distinguishes "ran ok" from "error/not ran"
+                    ok, err, err_type, ms, fmw_query_rows, fmw_query_ran = self._check_db(info)
+                    status = "COMPLETED" if ok else "FAILED"
+
+                    r = {
+                        "run_id":            self.run_id,
+                        "customer_id":       cid,
+                        "customer_name":     cname,
+                        "env_type":          env_type,
+                        "server_id":         server_id,
+                        "server_name":       server_name,
+                        "server_host":       server_host,
+                        "db_name":           tdb["db_name"],
+                        "db_type":           tdb.get("db_type", ""),
+                        "db_host":           server_host,
+                        "db_port":           tdb.get("db_port", 1521),
+                        "db_service":        tdb["db_service"],
+                        "connection_status": status,
+                        "error_message":     err or "",
+                        "error_type":        err_type if not ok else "",
+                        "duration_ms":       ms,
+                        "checked_at":        datetime.utcnow(),
+                        "fmw_query_rows":    fmw_query_rows,
+                        "fmw_query_ran":     fmw_query_ran,  # True = query ran ok, False = did not run
+                    }
+                    self._save(r)
+
+                    # Save to fmw_query_result only when query actually ran successfully
+                    if tdb.get("db_type", "").upper() == "FMW" and fmw_query_ran:
+                        self._save_fmw_results(self.run_id, r, fmw_query_rows)
+
+                    results.append(r)
+                    self._log_step(7, "DB_CONNECTION_CHECK", status,
+                                   f"DB={tdb['db_name']}  |  {ms}ms"
+                                   + (f"  |  [{err_type}] {err}" if err else ""),
+                                   cname, env_type)
+
+        # Summary
+        s = sum(1 for r in results if r["connection_status"] == "COMPLETED")
+        f = sum(1 for r in results if r["connection_status"] == "FAILED")
+        k = sum(1 for r in results if r["connection_status"] == "SKIPPED")
+        log.info("")
+        log.info(f"[Step 7]  Check complete  —  {len(results)} total  |  "
+                 f"connected={s}  |  not_connected={f}  |  skipped={k}")
+        return results
+
+----------------------------
+
+"""
+ExcelCreation/excel_manager.py
+==============================
+Generate Excel report for Oracle DB Connection Check.
+
+Sheet 1 — DB Connection Check (16 columns):
+  # | Customer | Environment | Server Name | Server ID | Server Host |
+  DB Name | DB Type | DSN | DB Connection Status |
+  Duration (ms) | Error | Error Type | Checked At (IST) |
+  Expired (Action Required) | Reason (if yes)
+
+Dynamic sheets — one per Customer + Environment (FMW db_type only):
+  Sheet name : "CustomerName - ENV"
+  Row 2      : FMW query read from app_config
+  Columns    : Server Host / DB Name / DB Type | USERNAME | ACCOUNT_STATUS |
+               EXPIRY_DATE | Action Required
+
+Expiry / Action Required rules:
+  FMW + CONNECTED + query ran   + date found   → Yes / Yes | Reason: date
+  FMW + CONNECTED + query ran   + no date      → No  / No  | Reason: blank
+  FMW + CONNECTED + query error / not configured → blank   | Reason: blank
+  FMW + NOT CONNECTED or SKIPPED               → blank     | Reason: blank
+  Non-FMW db_type (any status)                 → blank     | Reason: blank
+"""
+import logging
+import os
+from datetime import datetime, timedelta
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+log      = logging.getLogger("checker.excel")
+IST      = timedelta(hours=5, minutes=30)
+LAST_COL = 16   # 14 original + 2 expiry columns
+
+# ── Palette ───────────────────────────────────────────────────────────────────
+HDR_DARK   = "1565C0"
+HDR_MED    = "0D47A1"
+HDR_GREEN  = "1B5E20"
+SUMM_BG    = "E3F2FD"
+GREEN_BG   = "E8F5E9";  GREEN_BG2 = "F1F8E9"
+RED_BG     = "FFEBEE";  RED_BG2   = "FFF5F5"
+AMBER_BG   = "FFF8E1";  AMBER_BG2 = "FFFDE7"
+C_GREEN    = "2E7D32"
+C_RED      = "C62828"
+C_AMBER    = "E65100"
+C_BLUE     = "0D47A1"
+C_WHITE    = "FFFFFF"
+C_DARK_RED = "B71C1C"
+C_DARK_GRN = "1B5E20"
+
+STATUS_LABEL = {
+    "COMPLETED": "DB CONNECTED",
+    "FAILED":    "DB NOT CONNECTED",
+    "SKIPPED":   "SKIPPED",
+}
+STATUS_COLOR = {
+    "COMPLETED": C_GREEN,
+    "FAILED":    C_RED,
+    "SKIPPED":   C_AMBER,
+}
+ERR_LABEL = {
+    "TCP_TIMEOUT": "TCP Connection Timeout",
+    "PASSWORD":    "Password Expired / Invalid Username or Password",
+    "UNKNOWN":     "Unknown / Other Error",
+    "":            "",
+}
+ERR_COLOR = {"TCP_TIMEOUT": C_RED, "PASSWORD": C_AMBER, "UNKNOWN": C_BLUE, "": ""}
+
+_DEFAULT_FMW_QUERY = (
+    "SELECT USERNAME, ACCOUNT_STATUS, EXPIRY_DATE "
+    "FROM DBA_USERS WHERE USERNAME LIKE '%OAM%'"
+)
+
+
+def _border():
+    s = Side(style="thin", color="BDBDBD")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+
+def _ist(dt) -> str:
+    return (dt + IST).strftime("%d-%b-%Y %I:%M:%S %p IST") if dt else ""
+
+
+def _col(n):
+    return get_column_letter(n)
+
+
+# ── Expiry helpers ────────────────────────────────────────────────────────────
+
+def _is_expiry_set(val) -> bool:
+    # True only when EXPIRY_DATE contains an actual date — not null/none/empty
+    if val is None:
+        return False
+    return str(val).strip().upper() not in ("", "NULL", "NONE")
+
+
+def _compute_expiry_status(fmw_query_rows: list) -> tuple:
+    # Called only for rows where query ran successfully — returns (expired, action, reason)
+    if not fmw_query_rows:
+        return "No", "No", ""  # query ran but zero OAM accounts found
+    for row in fmw_query_rows:
+        expiry = row.get("EXPIRY_DATE", "")
+        if _is_expiry_set(expiry):
+            return "Yes", "Yes", str(expiry).strip()  # first account with a date wins
+    return "No", "No", ""  # all accounts have empty/null expiry
+
+
+def _build_expiry_map(results: list) -> dict:
+    # Builds (customer_name, env_type) → (expired, action, reason)
+    # Only includes FMW entries where connection COMPLETED and query actually ran
+    env_rows: dict = {}
+    for r in results:
+        if r.get("db_type", "").upper() != "FMW":
+            continue
+        if r.get("connection_status") != "COMPLETED":
+            continue  # failed/skipped — expiry columns stay blank
+        if not r.get("fmw_query_ran", False):
+            continue  # connected but query errored or not configured — stay blank
+        key = (r.get("customer_name", ""), r.get("env_type", ""))
+        env_rows.setdefault(key, []).extend(r.get("fmw_query_rows", []))
+    return {key: _compute_expiry_status(rows) for key, rows in env_rows.items()}
+
+
+# ── Sheet 1: DB Connection Check ─────────────────────────────────────────────
+
+def _write_connection_sheet(ws, results, run_id, timestamp, db_label, expiry_map):
+    total   = len(results)
+    success = sum(1 for r in results if r.get("connection_status") == "COMPLETED")
+    failed  = sum(1 for r in results if r.get("connection_status") == "FAILED")
+    skipped = sum(1 for r in results if r.get("connection_status") == "SKIPPED")
+    tcp_err = sum(1 for r in results if r.get("error_type") == "TCP_TIMEOUT")
+    pwd_err = sum(1 for r in results if r.get("error_type") == "PASSWORD")
+    unk_err = sum(1 for r in results
+                  if r.get("error_type") == "UNKNOWN"
+                  and r.get("connection_status") == "FAILED")
+
+    if total == 0:
+        summary, summ_color = "No data processed", C_RED
+    elif failed == 0 and skipped == 0:
+        summary, summ_color = "ALL CONNECTED  ✅", C_GREEN
+    elif success == 0:
+        summary, summ_color = (
+            f"NO SUCCESSFUL CONNECTIONS  ❌   "
+            f"Not Connected: {failed}  |  Skipped: {skipped}"), C_RED
+    else:
+        summary, summ_color = (
+            f"PARTIAL  ⚠    Connected: {success}  |  "
+            f"Not Connected: {failed}  |  Skipped: {skipped}"), C_AMBER
+
+    last_letter = _col(LAST_COL)
+
+    # Row 1 — Title
+    ws.merge_cells(f"A1:{last_letter}1")
+    c = ws["A1"]
+    c.value     = f"{db_label} Oracle DB Connection Check  |  Run #{run_id}  |  {timestamp}"
+    c.font      = Font(name="Calibri", size=13, bold=True, color=C_WHITE)
+    c.fill      = PatternFill("solid", fgColor=HDR_DARK)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 26
+
+    # Row 2 — Summary bar
+    ws.merge_cells(f"A2:{last_letter}2")
+    c = ws["A2"]
+    err_part = (
+        f"  |  Errors — TCP: {tcp_err}  |  Password: {pwd_err}  |  Unknown: {unk_err}"
+        if failed else "")
+    c.value = (
+        f"Total: {total}   ✅ Connected: {success}   ❌ Not Connected: {failed}"
+        f"   ⚠ Skipped: {skipped}{err_part}   —   {summary}")
+    c.font      = Font(name="Calibri", size=10, bold=True, color=summ_color)
+    c.fill      = PatternFill("solid", fgColor=SUMM_BG)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 20
+
+    # Row 3 — Headers
+    headers = [
+        "#", "Customer", "Environment", "Server Name", "Server ID",
+        "Server Host", "DB Name", "DB Type", "DSN (Host:Port/Service)",
+        "DB Connection Status", "Duration (ms)", "Error", "Error Type",
+        "Checked At (IST)",
+        "Expired\n(Action Required)", "Reason\n(if yes)",
+    ]
+    widths = [4, 22, 13, 18, 10, 22, 20, 11, 32, 20, 13, 45, 35, 24, 18, 45]
+
+    for col, (h, w) in enumerate(zip(headers, widths), 1):
+        c           = ws.cell(row=3, column=col, value=h)
+        c.font      = Font(name="Calibri", size=10, bold=True, color=C_WHITE)
+        c.fill      = PatternFill("solid", fgColor=HDR_MED)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border    = _border()
+        ws.column_dimensions[_col(col)].width = w
+    ws.row_dimensions[3].height = 30
+
+    ws.auto_filter.ref = f"A3:{last_letter}{3 + max(total, 1)}"
+
+    for idx, r in enumerate(results, 1):
+        row      = idx + 3
+        stat     = r.get("connection_status", "SKIPPED")
+        err_type = r.get("error_type", "") or ""
+
+        bg = (GREEN_BG if idx % 2 else GREEN_BG2) if stat == "COMPLETED" else \
+             (RED_BG   if idx % 2 else RED_BG2)   if stat == "FAILED"    else \
+             (AMBER_BG if idx % 2 else AMBER_BG2)
+
+        h   = r.get("db_host",    "") or ""
+        p   = r.get("db_port",    1521) or 1521
+        svc = r.get("db_service", "") or ""
+        dsn = f"{h}:{p}/{svc}" if h else ""
+
+        # Expiry: FMW + COMPLETED + query ran → compute value; everything else → blank
+        db_type_val = r.get("db_type", "").upper()
+        if db_type_val == "FMW" and stat == "COMPLETED" and r.get("fmw_query_ran", False):
+            key = (r.get("customer_name", ""), r.get("env_type", ""))
+            expired_str, action_str, reason_str = expiry_map.get(key, ("No", "No", ""))
+            expiry_display = f"{expired_str} / {action_str}"
+        else:
+            # blank for: failed, skipped, non-FMW, query errored, query not configured
+            expiry_display = ""
+            reason_str     = ""
+
+        values = [
+            idx,
+            r.get("customer_name",  "") or "",
+            r.get("env_type",       "") or "",
+            r.get("server_name",    "") or "",
+            r.get("server_id",      "") or "",
+            r.get("server_host",    "") or "",
+            r.get("db_name",        "") or "—",
+            r.get("db_type",        "") or "",
+            dsn,
+            STATUS_LABEL.get(stat, stat),
+            r.get("duration_ms",    0),
+            r.get("error_message",  "") or "",
+            ERR_LABEL.get(err_type, err_type),
+            _ist(r.get("checked_at")),
+            expiry_display,
+            reason_str,
+        ]
+
+        for col, val in enumerate(values, 1):
+            c           = ws.cell(row=row, column=col, value=val)
+            c.font      = Font(name="Calibri", size=10)
+            c.fill      = PatternFill("solid", fgColor=bg)
+            c.border    = _border()
+            c.alignment = Alignment(vertical="center", wrap_text=True)
+
+            if col == 10:  # DB Connection Status — bold coloured
+                c.font      = Font(name="Calibri", size=10, bold=True,
+                                   color=STATUS_COLOR.get(stat, C_RED))
+                c.alignment = Alignment(horizontal="center", vertical="center")
+
+            if col == 11:  # Duration — right-align
+                c.alignment = Alignment(horizontal="right", vertical="center")
+
+            if col == 12 and val:  # Error — italic
+                c.font = Font(name="Calibri", size=9, italic=True,
+                              color=STATUS_COLOR.get(stat, C_RED))
+
+            if col == 13 and val:  # Error Type — bold coloured
+                c.font = Font(name="Calibri", size=9, bold=True,
+                              color=ERR_COLOR.get(err_type, C_BLUE))
+
+            if col == 15 and expiry_display:  # Expired/Action — only when value present
+                c.font = Font(name="Calibri", size=10, bold=True,
+                              color=C_DARK_RED if expiry_display.startswith("Yes") else C_DARK_GRN)
+                c.alignment = Alignment(horizontal="center", vertical="center")
+
+            if col == 16 and reason_str:  # Reason — italic red only when date present
+                c.font = Font(name="Calibri", size=9, italic=True, color=C_DARK_RED)
+
+        ws.row_dimensions[row].height = 20
+
+    ws.freeze_panes = "A4"
+
+
+# ── Dynamic per-Customer/Env sheets (FMW only) ───────────────────────────────
+
+def _safe_sheet_name(name: str) -> str:
+    # Sanitise to valid Excel sheet name — max 31 chars, no illegal chars
+    for ch in r"\/:*?[]":
+        name = name.replace(ch, " ")
+    return name[:31].strip()
+
+
+def _write_fmw_env_sheet(ws, cname: str, env_type: str,
+                         env_results: list, run_id, timestamp, fmw_query: str):
+    # One sheet per Customer+Env — FMW db_type only
+    # Row 2 shows the live query from app_config
+    # Action Required: blank when not connected/skipped or query errored; Yes/No when query ran
+    SHEET_COLS  = 5
+    last_letter = _col(SHEET_COLS)
+
+    # Row 1 — Title with customer, env, run info
+    ws.merge_cells(f"A1:{last_letter}1")
+    c = ws["A1"]
+    c.value     = (f"{cname}  |  {env_type}  |  "
+                   f"FMW OAM Account Expiry  |  Run #{run_id}  |  {timestamp}")
+    c.font      = Font(name="Calibri", size=12, bold=True, color=C_WHITE)
+    c.fill      = PatternFill("solid", fgColor=HDR_GREEN)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 24
+
+    # Row 2 — FMW query read live from app_config
+    ws.merge_cells(f"A2:{last_letter}2")
+    c = ws["A2"]
+    c.value     = f"FMW Query : {fmw_query}"
+    c.font      = Font(name="Calibri", size=9, italic=True, color="37474F")
+    c.fill      = PatternFill("solid", fgColor="E8F5E9")
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[2].height = 16
+
+    # Row 3 — Headers
+    headers = [
+        "Server Host / DB Name / DB Type",
+        "USERNAME", "ACCOUNT_STATUS", "EXPIRY_DATE", "Action Required",
+    ]
+    widths = [40, 26, 20, 22, 18]
+
+    for col, (h, w) in enumerate(zip(headers, widths), 1):
+        c           = ws.cell(row=3, column=col, value=h)
+        c.font      = Font(name="Calibri", size=10, bold=True, color=C_WHITE)
+        c.fill      = PatternFill("solid", fgColor=HDR_GREEN)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border    = _border()
+        ws.column_dimensions[_col(col)].width = w
+    ws.row_dimensions[3].height = 22
+
+    data_rows = []
+    for r in env_results:
+        conn_info = (f"{r.get('server_host', '') or ''} / "
+                     f"{r.get('db_name',     '') or ''} / "
+                     f"{r.get('db_type',     '') or ''}")
+        stat          = r.get("connection_status", "FAILED")
+        fmw_rows      = r.get("fmw_query_rows", [])
+        fmw_query_ran = r.get("fmw_query_ran",  False)
+
+        if stat != "COMPLETED":
+            # Not connected or skipped — query never ran — all OAM columns blank
+            data_rows.append({
+                "conn_info": conn_info, "USERNAME": "",
+                "ACCOUNT_STATUS": "", "EXPIRY_DATE": "", "action": "",
+            })
+        elif not fmw_query_ran:
+            # Connected but query errored or not configured — leave action blank
+            data_rows.append({
+                "conn_info": conn_info, "USERNAME": "",
+                "ACCOUNT_STATUS": "", "EXPIRY_DATE": "", "action": "",
+            })
+        elif fmw_rows:
+            # Query ran and returned OAM accounts — one row per account
+            for frow in fmw_rows:
+                expiry = frow.get("EXPIRY_DATE", "") or ""
+                data_rows.append({
+                    "conn_info":      conn_info,
+                    "USERNAME":       frow.get("USERNAME",       ""),
+                    "ACCOUNT_STATUS": frow.get("ACCOUNT_STATUS", ""),
+                    "EXPIRY_DATE":    expiry,
+                    "action":         "Yes" if _is_expiry_set(expiry) else "No",
+                })
+        else:
+            # Query ran successfully but zero OAM accounts returned
+            data_rows.append({
+                "conn_info": conn_info, "USERNAME": "",
+                "ACCOUNT_STATUS": "", "EXPIRY_DATE": "", "action": "No",
+            })
+
+    ws.auto_filter.ref = f"A3:{last_letter}{3 + max(len(data_rows), 1)}"
+
+    for idx, dr in enumerate(data_rows, 1):
+        row      = idx + 3
+        bg       = "E8F5E9" if idx % 2 else "F1F8E9"
+        expiry   = dr["EXPIRY_DATE"]
+        has_date = _is_expiry_set(expiry)
+        action   = dr["action"]
+
+        for col, val in enumerate(
+            [dr["conn_info"], dr["USERNAME"], dr["ACCOUNT_STATUS"], expiry, action], 1
+        ):
+            c           = ws.cell(row=row, column=col, value=val)
+            c.font      = Font(name="Calibri", size=10)
+            c.fill      = PatternFill("solid", fgColor=bg)
+            c.border    = _border()
+            c.alignment = Alignment(vertical="center", wrap_text=True)
+
+            if col == 4 and has_date:  # EXPIRY_DATE — red bold when real date
+                c.font      = Font(name="Calibri", size=10, bold=True, color=C_DARK_RED)
+                c.alignment = Alignment(horizontal="center", vertical="center")
+
+            if col == 3 and val:  # ACCOUNT_STATUS — red if expired/locked, green otherwise
+                up = str(val).upper()
+                c.font = Font(name="Calibri", size=10, bold=True, color=C_RED) \
+                    if ("EXPIRED" in up or "LOCKED" in up) \
+                    else Font(name="Calibri", size=10, color=C_DARK_GRN)
+
+            if col == 5 and action:  # Action Required — only style when not blank
+                c.font = Font(name="Calibri", size=10, bold=True,
+                              color=C_DARK_RED if action == "Yes" else C_DARK_GRN)
+                c.alignment = Alignment(horizontal="center", vertical="center")
+
+        ws.row_dimensions[row].height = 20
+
+    ws.freeze_panes = "A4"
+
+    if not data_rows:
+        ws.merge_cells(f"A4:{last_letter}4")
+        c = ws["A4"]
+        c.value     = f"No FMW OAM accounts found for {cname} / {env_type}."
+        c.font      = Font(name="Calibri", size=10, italic=True, color=C_AMBER)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+def generate_excel(results, run_id, timestamp, excel_path,
+                   db_label="FMW", fmw_query: str = "") -> str:
+    # Generates report Excel — Sheet 1 (all DBs) + one sheet per FMW Customer/Env
+    os.makedirs(excel_path, exist_ok=True)
+
+    label    = (db_label or "FMW").upper().replace("/", "_").replace(" ", "_")
+    date_str = datetime.now().strftime("%d-%m-%y")
+    filename = f"{label}_CONNECTION_CHECKS_{date_str}-{run_id}.xlsx"
+    filepath = os.path.join(excel_path, filename)
+
+    query_text = fmw_query.strip() if fmw_query else _DEFAULT_FMW_QUERY
+
+    # Expiry map — only from FMW COMPLETED entries where query actually ran
+    expiry_map = _build_expiry_map(results)
+
+    wb = Workbook()
+
+    # Sheet 1 — DB Connection Check (all entries)
+    ws1 = wb.active
+    ws1.title = "DB Connection Check"
+    _write_connection_sheet(ws1, results, run_id, timestamp, db_label, expiry_map)
+
+    # Dynamic sheets — one per unique Customer + Environment for FMW db_type only
+    env_groups: dict = {}
+    for r in results:
+        if r.get("db_type", "").upper() != "FMW":
+            continue
+        key = (r.get("customer_name", "") or "", r.get("env_type", "") or "")
+        env_groups.setdefault(key, []).append(r)
+
+    used_names: dict = {}
+    for (cname, env_type), env_results in env_groups.items():
+        safe_name = _safe_sheet_name(f"{cname} - {env_type}")
+        if safe_name in used_names:
+            used_names[safe_name] += 1
+            safe_name = _safe_sheet_name(f"{safe_name} ({used_names[safe_name]})")
+        else:
+            used_names[safe_name] = 1
+        ws = wb.create_sheet(title=safe_name)
+        _write_fmw_env_sheet(ws, cname, env_type, env_results,
+                             run_id, timestamp, query_text)
+        log.info(f"  FMW sheet   : '{safe_name}'  ({len(env_results)} DB entry(s))")
+
+    wb.save(filepath)
+    log.info(f"  Excel saved : {filepath}")
+    return filepath
